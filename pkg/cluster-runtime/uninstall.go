@@ -58,21 +58,21 @@ func (i *Installer) UnInstall() error {
 
 	if i.regConfig.LocalRegistry != nil {
 		if *i.regConfig.LocalRegistry.HA {
-			installer := registry.NewInstaller(masters, i.regConfig.LocalRegistry, i.infraDriver, i.Distributor)
+			installer := registry.NewInstaller(masters, i.regConfig.LocalRegistry, i.infraDriver, i.SSHDistributor, i.P2PDistributor)
 			err = installer.Clean()
 			if err != nil {
 				return err
 			}
 		}
 
-		installer := registry.NewInstaller([]net.IP{master0}, i.regConfig.LocalRegistry, i.infraDriver, i.Distributor)
+		installer := registry.NewInstaller([]net.IP{master0}, i.regConfig.LocalRegistry, i.infraDriver, i.SSHDistributor, i.P2PDistributor)
 		err = installer.Clean()
 		if err != nil {
 			return err
 		}
 	}
 
-	registryConfigurator, err := registry.NewConfigurator(nil, crInfo, i.regConfig, i.infraDriver, i.Distributor)
+	registryConfigurator, err := registry.NewConfigurator(nil, crInfo, i.regConfig, i.infraDriver, i.SSHDistributor, i.P2PDistributor)
 	if err != nil {
 		return err
 	}
@@ -98,7 +98,7 @@ func (i *Installer) UnInstall() error {
 		return err
 	}
 
-	if err = i.Distributor.Restore(i.infraDriver.GetClusterBasePath(), all); err != nil {
+	if err = i.SSHDistributor.Restore(i.infraDriver.GetClusterBasePath(), all); err != nil {
 		return err
 	}
 

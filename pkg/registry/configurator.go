@@ -52,14 +52,16 @@ func NewConfigurator(deployHosts []net.IP,
 	containerRuntimeInfo containerruntime.Info,
 	regConfig v2.Registry,
 	infraDriver infradriver.InfraDriver,
-	distributor imagedistributor.Distributor) (Configurator, error) {
+	sshDistributor imagedistributor.Distributor,
+	p2pDistributor imagedistributor.Distributor) (Configurator, error) {
 	if regConfig.LocalRegistry != nil {
 		return &localConfigurator{
 			deployHosts:          deployHosts,
 			infraDriver:          infraDriver,
 			LocalRegistry:        regConfig.LocalRegistry,
 			containerRuntimeInfo: containerRuntimeInfo,
-			distributor:          distributor,
+			sshDistributor:       sshDistributor,
+			p2pDistributor:       p2pDistributor,
 		}, nil
 	}
 

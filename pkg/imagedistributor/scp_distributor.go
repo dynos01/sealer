@@ -149,6 +149,8 @@ func (s *scpDistributor) Distribute(hosts []net.IP, dest string) error {
 		}
 	}
 
+	logrus.Warnf("OKAY!")
+
 	return nil
 }
 

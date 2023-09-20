@@ -37,6 +37,10 @@ type RunFlags struct {
 	//if not, will force sync sealer rootfs.
 	//default is false.
 	IgnoreCache bool
+
+	// P2PDistribution: enable P2P-based and multicast-based image distribution
+	// default is true
+	P2PDistribution bool
 }
 
 type ApplyFlags struct {
