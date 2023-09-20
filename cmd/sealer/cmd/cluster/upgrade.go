@@ -169,7 +169,7 @@ func upgradeCluster(cf clusterfile.Interface, imageEngine imageengine.Interface,
 	}
 
 	runtimeConfig := &clusterruntime.RuntimeConfig{
-		Distributor:            distributor,
+		SSHDistributor:         distributor,
 		Plugins:                plugins,
 		ContainerRuntimeConfig: cluster.Spec.ContainerRuntime,
 	}

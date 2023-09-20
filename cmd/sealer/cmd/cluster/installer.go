@@ -52,6 +52,7 @@ type AppInstallOptions struct {
 	RunMode                 string
 	SkipPrepareAppMaterials bool
 	IgnoreCache             bool
+	P2PDistribution    bool
 }
 
 func (i AppInstaller) Install(imageName string, options AppInstallOptions) error {
@@ -60,7 +61,7 @@ func (i AppInstaller) Install(imageName string, options AppInstallOptions) error
 	i.infraDriver.AddClusterEnv(options.Envs)
 
 	if !options.SkipPrepareAppMaterials {
-		if err := i.prepareMaterials(imageName, options.RunMode, options.IgnoreCache); err != nil {
+		if err := i.prepareMaterials(imageName, options.RunMode, options.IgnoreCache, options.P2PDistribution); err != nil {
 			return err
 		}
 	}
@@ -87,7 +88,7 @@ func (i AppInstaller) Install(imageName string, options AppInstallOptions) error
 	return nil
 }
 
-func (i AppInstaller) prepareMaterials(appImageName string, mode string, ignoreCache bool) error {
+func (i AppInstaller) prepareMaterials(appImageName string, mode string, ignoreCache bool, p2pDistribution bool) error {
 	clusterHosts := i.infraDriver.GetHostIPList()
 	clusterHostsPlatform, err := i.infraDriver.GetHostsPlatform(clusterHosts)
 	if err != nil {
@@ -118,22 +119,39 @@ func (i AppInstaller) prepareMaterials(appImageName string, mode string, ignoreC
 		}
 	}
 
-	distributor, err := imagedistributor.NewScpDistributor(imageMountInfo, i.infraDriver, nil, imagedistributor.DistributeOption{
+	sshDistributor, err := imagedistributor.NewScpDistributor(imageMountInfo, i.infraDriver, nil, imagedistributor.DistributeOption{
 		IgnoreCache: ignoreCache,
 	})
 	if err != nil {
 		return err
 	}
 
+	var p2pDistributor imagedistributor.Distributor
+	if p2pDistribution {
+		p2pDistributor, err = imagedistributor.NewP2PDistributor(imageMountInfo, i.infraDriver, nil, imagedistributor.DistributeOption{
+			IgnoreCache: ignoreCache,
+		})
+		if err != nil {
+			logrus.Warnf("failed to initialize P2P-based distributor: %s", err)
+		}
+	}
+
 	if mode == common.ApplyModeLoadImage {
-		return loadToRegistry(i.infraDriver, distributor)
+		return loadToRegistry(i.infraDriver, sshDistributor)
 	}
 
 	masters := i.infraDriver.GetHostIPListByRole(common.MASTER)
 	regConfig := i.infraDriver.GetClusterRegistry()
 	// distribute rootfs
-	if err := distributor.Distribute(masters, i.infraDriver.GetClusterRootfsPath()); err != nil {
-		return err
+
+	if p2pDistribution {
+		if err := p2pDistributor.Distribute(masters, i.infraDriver.GetClusterRootfsPath()); err != nil {
+			return err
+		}
+	} else {
+		if err := sshDistributor.Distribute(masters, i.infraDriver.GetClusterRootfsPath()); err != nil {
+			return err
+		}
 	}
 
 	//if we use local registry service, load container image to registry
@@ -147,7 +165,7 @@ func (i AppInstaller) prepareMaterials(appImageName string, mode string, ignoreC
 
 	registryConfigurator, err := registry.NewConfigurator(deployHosts,
 		containerruntime.Info{},
-		regConfig, i.infraDriver, distributor)
+		regConfig, i.infraDriver, sshDistributor, p2pDistributor)
 	if err != nil {
 		return err
 	}
@@ -199,8 +217,9 @@ type KubeInstaller struct {
 }
 
 type KubeInstallOptions struct {
-	RunMode     string
-	IgnoreCache bool
+	RunMode              string
+	IgnoreCache          bool
+	P2PDistribution bool
 }
 
 type KubeScaleUpOptions struct {
@@ -276,6 +295,16 @@ func (k KubeInstaller) Install(kubeImageName string, options KubeInstallOptions)
 		return err
 	}
 
+	var p2pDistributor imagedistributor.Distributor
+	if options.P2PDistribution {
+		p2pDistributor, err = imagedistributor.NewP2PDistributor(imageMountInfo, k.infraDriver, configsFromFile, imagedistributor.DistributeOption{
+			IgnoreCache: options.IgnoreCache,
+		})
+		if err != nil {
+			logrus.Warnf("failed to initialize P2P-based distributor: %s", err)
+		}
+	}
+
 	if options.RunMode == common.ApplyModeLoadImage {
 		return clusterruntime.LoadToRegistry(k.infraDriver, distributor)
 	}
@@ -290,7 +319,8 @@ func (k KubeInstaller) Install(kubeImageName string, options KubeInstallOptions)
 	}
 
 	runtimeConfig := &clusterruntime.RuntimeConfig{
-		Distributor:            distributor,
+		SSHDistributor:         distributor,
+		P2PDistributor:         p2pDistributor,
 		Plugins:                plugins,
 		ContainerRuntimeConfig: cluster.Spec.ContainerRuntime,
 	}
@@ -385,7 +415,7 @@ func (k KubeInstaller) ScaleUp(scaleUpMasterIPList, scaleUpNodeIPList []net.IP, 
 	}
 
 	runtimeConfig := &clusterruntime.RuntimeConfig{
-		Distributor:            distributor,
+		SSHDistributor:         distributor,
 		Plugins:                plugins,
 		ContainerRuntimeConfig: cluster.Spec.ContainerRuntime,
 	}
@@ -461,7 +491,7 @@ func (k KubeInstaller) ScaleDown(deleteMasterIPList, deleteNodeIPList []net.IP, 
 		if err != nil {
 			return err
 		}
-		runtimeConfig.Distributor = distributor
+		runtimeConfig.SSHDistributor = distributor
 
 		plugins, err := loadPluginsFromImage(imageMountInfo)
 		if err != nil {
@@ -550,7 +580,7 @@ func (k KubeInstaller) Delete(options KubeDeleteOptions) error {
 	}
 
 	runtimeConfig := &clusterruntime.RuntimeConfig{
-		Distributor:            distributor,
+		SSHDistributor:         distributor,
 		Plugins:                plugins,
 		ContainerRuntimeConfig: cluster.Spec.ContainerRuntime,
 	}

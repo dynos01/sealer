@@ -53,7 +53,8 @@ type localConfigurator struct {
 	deployHosts          []net.IP
 	containerRuntimeInfo containerruntime.Info
 	infraDriver          infradriver.InfraDriver
-	distributor          imagedistributor.Distributor
+	sshDistributor       imagedistributor.Distributor
+	p2pDistributor       imagedistributor.Distributor
 }
 
 func (c *localConfigurator) GetRegistryInfo() RegistryInfo {
@@ -70,7 +71,7 @@ func (c *localConfigurator) GetRegistryInfo() RegistryInfo {
 func (c *localConfigurator) GetDriver() (Driver, error) {
 	endpoint := net.JoinHostPort(c.Domain, strconv.Itoa(c.Port))
 	dataDir := filepath.Join(c.infraDriver.GetClusterRootfsPath(), "registry")
-	return newLocalRegistryDriver(endpoint, dataDir, c.deployHosts, c.distributor), nil
+	return newLocalRegistryDriver(endpoint, dataDir, c.deployHosts, c.sshDistributor), nil
 }
 
 func (c *localConfigurator) UninstallFrom(deletedMasters, deletedNodes []net.IP) error {

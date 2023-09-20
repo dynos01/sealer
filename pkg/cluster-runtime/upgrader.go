@@ -31,8 +31,14 @@ func (i *Installer) Upgrade() error {
 	)
 
 	// distribute rootfs
-	if err := i.Distributor.Distribute(all, rootfs); err != nil {
-		return err
+	if i.P2PDistributor != nil {
+		if err := i.P2PDistributor.Distribute(all, rootfs); err != nil {
+			return err
+		}
+	} else {
+		if err := i.SSHDistributor.Distribute(all, rootfs); err != nil {
+			return err
+		}
 	}
 
 	if err := i.runHostHook(UpgradeHost, all); err != nil {
@@ -46,7 +52,7 @@ func (i *Installer) Upgrade() error {
 
 	var deployHosts []net.IP
 	if i.regConfig.LocalRegistry != nil {
-		installer := registry.NewInstaller(nil, i.regConfig.LocalRegistry, i.infraDriver, i.Distributor)
+		installer := registry.NewInstaller(nil, i.regConfig.LocalRegistry, i.infraDriver, i.SSHDistributor, i.P2PDistributor)
 		if *i.regConfig.LocalRegistry.HA {
 			deployHosts, err = installer.Reconcile(masters)
 			if err != nil {
@@ -59,7 +65,7 @@ func (i *Installer) Upgrade() error {
 			}
 		}
 	}
-	registryConfigurator, err := registry.NewConfigurator(deployHosts, crInfo, i.regConfig, i.infraDriver, i.Distributor)
+	registryConfigurator, err := registry.NewConfigurator(deployHosts, crInfo, i.regConfig, i.infraDriver, i.SSHDistributor, i.P2PDistributor)
 	if err != nil {
 		return err
 	}

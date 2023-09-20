@@ -53,8 +53,14 @@ func (i *Installer) ScaleUp(newMasters, newWorkers []net.IP) (registry.Driver, r
 		return nil, nil, err
 	}
 	// distribute rootfs
-	if err := i.Distributor.Distribute(all, rootfs); err != nil {
-		return nil, nil, err
+	if i.P2PDistributor != nil {
+		if err := i.P2PDistributor.Distribute(all, rootfs); err != nil {
+			return nil, nil, err
+		}
+	} else {
+		if err := i.SSHDistributor.Distribute(all, rootfs); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	if err := i.runClusterHook(master0, PreScaleUpCluster); err != nil {
@@ -76,13 +82,13 @@ func (i *Installer) ScaleUp(newMasters, newWorkers []net.IP) (registry.Driver, r
 
 	// reconcile registry node if local registry is ha mode.
 	if i.regConfig.LocalRegistry != nil && *i.regConfig.LocalRegistry.HA {
-		registryDeployHosts, err = registry.NewInstaller(netutils.RemoveIPs(masters, newMasters), i.regConfig.LocalRegistry, i.infraDriver, i.Distributor).Reconcile(masters)
+		registryDeployHosts, err = registry.NewInstaller(netutils.RemoveIPs(masters, newMasters), i.regConfig.LocalRegistry, i.infraDriver, i.SSHDistributor, i.P2PDistributor).Reconcile(masters)
 		if err != nil {
 			return nil, nil, err
 		}
 	}
 
-	registryConfigurator, err := registry.NewConfigurator(registryDeployHosts, crInfo, i.regConfig, i.infraDriver, i.Distributor)
+	registryConfigurator, err := registry.NewConfigurator(registryDeployHosts, crInfo, i.regConfig, i.infraDriver, i.SSHDistributor, i.P2PDistributor)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -148,13 +154,13 @@ func (i *Installer) ScaleDown(mastersToDelete, workersToDelete []net.IP) (regist
 	registryDeployHosts := []net.IP{master0}
 	// reconcile registry node if local registry is ha mode.
 	if i.regConfig.LocalRegistry != nil && *i.regConfig.LocalRegistry.HA {
-		registryDeployHosts, err = registry.NewInstaller(masters, i.regConfig.LocalRegistry, i.infraDriver, i.Distributor).Reconcile(netutils.RemoveIPs(masters, mastersToDelete))
+		registryDeployHosts, err = registry.NewInstaller(masters, i.regConfig.LocalRegistry, i.infraDriver, i.SSHDistributor, i.P2PDistributor).Reconcile(netutils.RemoveIPs(masters, mastersToDelete))
 		if err != nil {
 			return nil, nil, err
 		}
 	}
 
-	registryConfigurator, err := registry.NewConfigurator(registryDeployHosts, crInfo, i.regConfig, i.infraDriver, i.Distributor)
+	registryConfigurator, err := registry.NewConfigurator(registryDeployHosts, crInfo, i.regConfig, i.infraDriver, i.SSHDistributor, i.P2PDistributor)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -232,8 +238,8 @@ func (i *Installer) resetAndScaleDown(kubeRuntimeInstaller runtime.Installer, re
 		return err
 	}
 
-	if i.Distributor != nil {
-		if err := i.Distributor.Restore(i.infraDriver.GetClusterBasePath(), allToDelete); err != nil {
+	if i.SSHDistributor != nil {
+		if err := i.SSHDistributor.Restore(i.infraDriver.GetClusterBasePath(), allToDelete); err != nil {
 			return err
 		}
 	}

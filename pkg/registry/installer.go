@@ -50,12 +50,13 @@ type Installer interface {
 func NewInstaller(currentDeployHost []net.IP,
 	regConfig *v2.LocalRegistry,
 	infraDriver infradriver.InfraDriver,
-	distributor imagedistributor.Distributor) Installer {
+	sshDistributor imagedistributor.Distributor,
+	p2pDistributor imagedistributor.Distributor) Installer {
 	return &localInstaller{
 		currentDeployHosts: currentDeployHost,
 		infraDriver:        infraDriver,
 		LocalRegistry:      regConfig,
-		distributor:        distributor,
+		distributor:        sshDistributor,
 	}
 }
 
