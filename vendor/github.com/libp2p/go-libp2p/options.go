@@ -4,35 +4,26 @@ package libp2p
 // those are in defaults.go).
 
 import (
-	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"reflect"
 	"time"
 
+	"github.com/libp2p/go-libp2p-core/connmgr"
+	"github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/libp2p/go-libp2p-core/metrics"
+	"github.com/libp2p/go-libp2p-core/network"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/peerstore"
+	"github.com/libp2p/go-libp2p-core/pnet"
+
 	"github.com/libp2p/go-libp2p/config"
-	"github.com/libp2p/go-libp2p/core/connmgr"
-	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/metrics"
-	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/peerstore"
-	"github.com/libp2p/go-libp2p/core/pnet"
-	"github.com/libp2p/go-libp2p/core/protocol"
-	"github.com/libp2p/go-libp2p/core/transport"
 	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
 	bhost "github.com/libp2p/go-libp2p/p2p/host/basic"
-	"github.com/libp2p/go-libp2p/p2p/net/swarm"
-	tptu "github.com/libp2p/go-libp2p/p2p/net/upgrader"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
-	"github.com/libp2p/go-libp2p/p2p/transport/quicreuse"
-	"github.com/prometheus/client_golang/prometheus"
 
 	ma "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
-	"go.uber.org/fx"
 )
 
 // ListenAddrStrings configures libp2p to listen on the given (unparsed)
@@ -71,12 +62,17 @@ func ListenAddrs(addrs ...ma.Multiaddr) Option {
 // * Host
 // * Network
 // * Peerstore
-func Security(name string, constructor interface{}) Option {
+func Security(name string, tpt interface{}) Option {
+	stpt, err := config.SecurityConstructor(tpt)
+	err = traceError(err, 1)
 	return func(cfg *Config) error {
+		if err != nil {
+			return err
+		}
 		if cfg.Insecure {
 			return fmt.Errorf("cannot use security transports with an insecure libp2p configuration")
 		}
-		cfg.SecurityTransports = append(cfg.SecurityTransports, config.Security{ID: protocol.ID(name), Constructor: constructor})
+		cfg.SecurityTransports = append(cfg.SecurityTransports, config.MsSecC{SecC: stpt, ID: name})
 		return nil
 	}
 }
@@ -91,38 +87,25 @@ var NoSecurity Option = func(cfg *Config) error {
 	return nil
 }
 
-// Muxer configures libp2p to use the given stream multiplexer.
-// name is the protocol name.
-func Muxer(name string, muxer network.Multiplexer) Option {
+// Muxer configures libp2p to use the given stream multiplexer (or stream
+// multiplexer constructor).
+//
+// Name is the protocol name.
+//
+// The transport can be a constructed mux.Transport or a function taking any
+// subset of this libp2p node's:
+// * Peer ID
+// * Host
+// * Network
+// * Peerstore
+func Muxer(name string, tpt interface{}) Option {
+	mtpt, err := config.MuxerConstructor(tpt)
+	err = traceError(err, 1)
 	return func(cfg *Config) error {
-		cfg.Muxers = append(cfg.Muxers, tptu.StreamMuxer{Muxer: muxer, ID: protocol.ID(name)})
-		return nil
-	}
-}
-
-func QUICReuse(constructor interface{}, opts ...quicreuse.Option) Option {
-	return func(cfg *Config) error {
-		tag := `group:"quicreuseopts"`
-		typ := reflect.ValueOf(constructor).Type()
-		numParams := typ.NumIn()
-		isVariadic := typ.IsVariadic()
-
-		if !isVariadic && len(opts) > 0 {
-			return errors.New("QUICReuse constructor doesn't take any options")
+		if err != nil {
+			return err
 		}
-
-		var params []string
-		if isVariadic && len(opts) > 0 {
-			// If there are options, apply the tag.
-			// Since options are variadic, they have to be the last argument of the constructor.
-			params = make([]string, numParams)
-			params[len(params)-1] = tag
-		}
-
-		cfg.QUICReuse = append(cfg.QUICReuse, fx.Provide(fx.Annotate(constructor, fx.ParamTags(params...))))
-		for _, opt := range opts {
-			cfg.QUICReuse = append(cfg.QUICReuse, fx.Supply(fx.Annotate(opt, fx.ResultTags(tag))))
-		}
+		cfg.Muxers = append(cfg.Muxers, config.MsMuxC{MuxC: mtpt, ID: name})
 		return nil
 	}
 }
@@ -142,55 +125,14 @@ func QUICReuse(constructor interface{}, opts ...quicreuse.Option) Option {
 // * Public Key
 // * Address filter (filter.Filter)
 // * Peerstore
-func Transport(constructor interface{}, opts ...interface{}) Option {
+func Transport(tpt interface{}, opts ...interface{}) Option {
+	tptc, err := config.TransportConstructor(tpt, opts...)
+	err = traceError(err, 1)
 	return func(cfg *Config) error {
-		// generate a random identifier, so that fx can associate the constructor with its options
-		b := make([]byte, 8)
-		rand.Read(b)
-		id := binary.BigEndian.Uint64(b)
-
-		tag := fmt.Sprintf(`group:"transportopt_%d"`, id)
-
-		typ := reflect.ValueOf(constructor).Type()
-		numParams := typ.NumIn()
-		isVariadic := typ.IsVariadic()
-
-		if !isVariadic && len(opts) > 0 {
-			return errors.New("transport constructor doesn't take any options")
+		if err != nil {
+			return err
 		}
-		if isVariadic && numParams >= 1 {
-			paramType := typ.In(numParams - 1).Elem()
-			for _, opt := range opts {
-				if typ := reflect.TypeOf(opt); !typ.AssignableTo(paramType) {
-					return fmt.Errorf("transport option of type %s not assignable to %s", typ, paramType)
-				}
-			}
-		}
-
-		var params []string
-		if isVariadic && len(opts) > 0 {
-			// If there are transport options, apply the tag.
-			// Since options are variadic, they have to be the last argument of the constructor.
-			params = make([]string, numParams)
-			params[len(params)-1] = tag
-		}
-
-		cfg.Transports = append(cfg.Transports, fx.Provide(
-			fx.Annotate(
-				constructor,
-				fx.ParamTags(params...),
-				fx.As(new(transport.Transport)),
-				fx.ResultTags(`group:"transport"`),
-			),
-		))
-		for _, opt := range opts {
-			cfg.Transports = append(cfg.Transports, fx.Supply(
-				fx.Annotate(
-					opt,
-					fx.ResultTags(tag),
-				),
-			))
-		}
+		cfg.Transports = append(cfg.Transports, tptc)
 		return nil
 	}
 }
@@ -291,7 +233,7 @@ func DisableRelay() Option {
 }
 
 // EnableRelayService configures libp2p to run a circuit v2 relay,
-// if we detect that we're publicly reachable.
+// if we dected that we're publicly reachable.
 func EnableRelayService(opts ...relayv2.Option) Option {
 	return func(cfg *Config) error {
 		cfg.EnableRelayService = true
@@ -303,46 +245,47 @@ func EnableRelayService(opts ...relayv2.Option) Option {
 // EnableAutoRelay configures libp2p to enable the AutoRelay subsystem.
 //
 // Dependencies:
-//   - Relay (enabled by default)
-//   - Either:
-//     1. A list of static relays
-//     2. A PeerSource function that provides a chan of relays. See `autorelay.WithPeerSource`
+//  * Relay (enabled by default)
+//  * Routing (to find relays), or StaticRelays/DefaultStaticRelays.
 //
 // This subsystem performs automatic address rewriting to advertise relay addresses when it
 // detects that the node is publicly unreachable (e.g. behind a NAT).
-//
-// Deprecated: Use EnableAutoRelayWithStaticRelays or EnableAutoRelayWithPeerSource
-func EnableAutoRelay(opts ...autorelay.Option) Option {
+func EnableAutoRelay(opts ...autorelay.StaticRelayOption) Option {
 	return func(cfg *Config) error {
+		if len(opts) > 0 {
+			if len(opts) > 1 {
+				return errors.New("only expected a single static relay configuration option")
+			}
+			cfg.StaticRelayOpt = opts[0]
+		}
 		cfg.EnableAutoRelay = true
-		cfg.AutoRelayOpts = opts
 		return nil
 	}
 }
 
-// EnableAutoRelayWithStaticRelays configures libp2p to enable the AutoRelay subsystem using
-// the provided relays as relay candidates.
-// This subsystem performs automatic address rewriting to advertise relay addresses when it
-// detects that the node is publicly unreachable (e.g. behind a NAT).
-func EnableAutoRelayWithStaticRelays(static []peer.AddrInfo, opts ...autorelay.Option) Option {
+// StaticRelays configures known relays for autorelay; when this option is enabled
+// then the system will use the configured relays instead of querying the DHT to
+// discover relays.
+// Deprecated: pass an autorelay.WithStaticRelays option to EnableAutoRelay.
+func StaticRelays(relays []peer.AddrInfo) Option {
 	return func(cfg *Config) error {
-		cfg.EnableAutoRelay = true
-		cfg.AutoRelayOpts = append([]autorelay.Option{autorelay.WithStaticRelays(static)}, opts...)
+		cfg.StaticRelayOpt = autorelay.WithStaticRelays(relays)
 		return nil
 	}
 }
 
-// EnableAutoRelayWithPeerSource configures libp2p to enable the AutoRelay
-// subsystem using the provided PeerSource callback to get more relay
-// candidates.  This subsystem performs automatic address rewriting to advertise
-// relay addresses when it detects that the node is publicly unreachable (e.g.
-// behind a NAT).
-func EnableAutoRelayWithPeerSource(peerSource autorelay.PeerSource, opts ...autorelay.Option) Option {
-	return func(cfg *Config) error {
-		cfg.EnableAutoRelay = true
-		cfg.AutoRelayOpts = append([]autorelay.Option{autorelay.WithPeerSource(peerSource)}, opts...)
-		return nil
+// DefaultStaticRelays configures the static relays to use the known PL-operated relays.
+// Deprecated: pass autorelay.WithDefaultStaticRelays to EnableAutoRelay.
+func DefaultStaticRelays() Option {
+	relays := make([]peer.AddrInfo, 0, len(autorelay.DefaultRelays))
+	for _, addr := range autorelay.DefaultRelays {
+		pi, err := peer.AddrInfoFromString(addr)
+		if err != nil {
+			panic(fmt.Sprintf("failed to initialize default static relays: %s", err))
+		}
+		relays = append(relays, *pi)
 	}
+	return StaticRelays(relays)
 }
 
 // ForceReachabilityPublic overrides automatic reachability detection in the AutoNAT subsystem,
@@ -392,26 +335,13 @@ func AutoNATServiceRateLimit(global, perPeer int, interval time.Duration) Option
 // to actively reject inbound/outbound connections based on the lifecycle stage
 // of the connection.
 //
-// For more information, refer to go-libp2p/core.ConnectionGater.
+// For more information, refer to go-libp2p-core.ConnectionGater.
 func ConnectionGater(cg connmgr.ConnectionGater) Option {
 	return func(cfg *Config) error {
 		if cfg.ConnectionGater != nil {
 			return errors.New("cannot configure multiple connection gaters, or cannot configure both Filters and ConnectionGater")
 		}
 		cfg.ConnectionGater = cg
-		return nil
-	}
-}
-
-// ResourceManager configures libp2p to use the given ResourceManager.
-// When using the p2p/host/resource-manager implementation of the ResourceManager interface,
-// it is recommended to set limits for libp2p protocol by calling SetDefaultServiceLimits.
-func ResourceManager(rcmgr network.ResourceManager) Option {
-	return func(cfg *Config) error {
-		if cfg.ResourceManager != nil {
-			return errors.New("cannot configure multiple resource managers")
-		}
-		cfg.ResourceManager = rcmgr
 		return nil
 	}
 }
@@ -473,17 +403,8 @@ var NoListenAddrs = func(cfg *Config) error {
 // This will both clear any configured transports (specified in prior libp2p
 // options) and prevent libp2p from applying the default transports.
 var NoTransports = func(cfg *Config) error {
-	cfg.Transports = []fx.Option{}
+	cfg.Transports = []config.TptC{}
 	return nil
-}
-
-// ProtocolVersion sets the protocolVersion string required by the
-// libp2p Identify protocol.
-func ProtocolVersion(s string) Option {
-	return func(cfg *Config) error {
-		cfg.ProtocolVersion = s
-		return nil
-	}
 }
 
 // UserAgent sets the libp2p user-agent sent along with the identify protocol
@@ -507,14 +428,14 @@ func MultiaddrResolver(rslv *madns.Resolver) Option {
 // to create direct/NAT-traversed connections with other peers. (default: disabled)
 //
 // Dependencies:
-//   - Relay (enabled by default)
+//  * Relay (enabled by default)
 //
 // This subsystem performs two functions:
 //
-//  1. On receiving an inbound Relay connection, it attempts to create a direct connection with the remote peer
-//     by initiating and co-ordinating a hole punch over the Relayed connection.
-//  2. If a peer sees a request to co-ordinate a hole punch on an outbound Relay connection,
-//     it will participate in the hole-punch to create a direct connection with the remote peer.
+// 1. On receiving an inbound Relay connection, it attempts to create a direct connection with the remote peer
+//    by initiating and co-ordinating a hole punch over the Relayed connection.
+// 2. If a peer sees a request to co-ordinate a hole punch on an outbound Relay connection,
+//    it will participate in the hole-punch to create a direct connection with the remote peer.
 //
 // If the hole punch is successful, all new streams will thereafter be created on the hole-punched connection.
 // The Relayed connection will eventually be closed after a grace period.
@@ -537,63 +458,6 @@ func EnableHolePunching(opts ...holepunch.Option) Option {
 	return func(cfg *Config) error {
 		cfg.EnableHolePunching = true
 		cfg.HolePunchingOptions = opts
-		return nil
-	}
-}
-
-func WithDialTimeout(t time.Duration) Option {
-	return func(cfg *Config) error {
-		if t <= 0 {
-			return errors.New("dial timeout needs to be non-negative")
-		}
-		cfg.DialTimeout = t
-		return nil
-	}
-}
-
-// DisableMetrics configures libp2p to disable prometheus metrics
-func DisableMetrics() Option {
-	return func(cfg *Config) error {
-		cfg.DisableMetrics = true
-		return nil
-	}
-}
-
-// PrometheusRegisterer configures libp2p to use reg as the Registerer for all metrics subsystems
-func PrometheusRegisterer(reg prometheus.Registerer) Option {
-	return func(cfg *Config) error {
-		if cfg.DisableMetrics {
-			return errors.New("cannot set registerer when metrics are disabled")
-		}
-		if cfg.PrometheusRegisterer != nil {
-			return errors.New("registerer already set")
-		}
-		if reg == nil {
-			return errors.New("registerer cannot be nil")
-		}
-		cfg.PrometheusRegisterer = reg
-		return nil
-	}
-}
-
-// DialRanker configures libp2p to use d as the dial ranker. To enable smart
-// dialing use `swarm.DefaultDialRanker`. use `swarm.NoDelayDialRanker` to
-// disable smart dialing.
-// Deprecated: use SwarmOpts(swarm.WithDialRanker(d)) instead
-func DialRanker(d network.DialRanker) Option {
-	return func(cfg *Config) error {
-		if cfg.DialRanker != nil {
-			return errors.New("dial ranker already configured")
-		}
-		cfg.DialRanker = d
-		return nil
-	}
-}
-
-// SwarmOpts configures libp2p to use swarm with opts
-func SwarmOpts(opts ...swarm.Option) Option {
-	return func(cfg *Config) error {
-		cfg.SwarmOpts = opts
 		return nil
 	}
 }

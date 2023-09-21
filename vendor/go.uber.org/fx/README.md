@@ -1,40 +1,51 @@
-# :unicorn: Fx [![GoDoc](https://pkg.go.dev/badge/go.uber.org/fx)](https://pkg.go.dev/go.uber.org/fx) [![Github release](https://img.shields.io/github/release/uber-go/fx.svg)](https://github.com/uber-go/fx/releases) [![Build Status](https://github.com/uber-go/fx/actions/workflows/go.yml/badge.svg)](https://github.com/uber-go/fx/actions/workflows/go.yml) [![Coverage Status](https://codecov.io/gh/uber-go/fx/branch/master/graph/badge.svg)](https://codecov.io/gh/uber-go/fx/branch/master) [![Go Report Card](https://goreportcard.com/badge/go.uber.org/fx)](https://goreportcard.com/report/go.uber.org/fx)
+# :unicorn: Fx [![GoDoc][doc-img]][doc] [![Github release][release-img]][release] [![Build Status][ci-img]][ci] [![Coverage Status][cov-img]][cov] [![Go Report Card][report-card-img]][report-card]
 
-Fx is a dependency injection system for Go.
+An application framework for Go that:
 
-**Benefits**
-
-- Eliminate globals: Fx helps you remove global state from your application.
-  No more `init()` or global variables. Use Fx-managed singletons.
-- Code reuse: Fx lets teams within your organization build loosely-coupled
-  and well-integrated shareable components.
-- Battle tested: Fx is the backbone of nearly all Go services at Uber.
-
-See our [docs](https://uber-go.github.io/fx/) to get started and/or
-learn more about Fx.
+* Makes dependency injection easy.
+* Eliminates the need for global state and `func init()`.
 
 ## Installation
 
-Use Go modules to install Fx in your application.
+We recommend locking to [SemVer](http://semver.org/) range `^1` using [Glide](https://github.com/Masterminds/glide):
 
-```shell
+```
+glide get 'go.uber.org/fx#^1'
+```
+
+Alternatively you can add it as a dependency using [go mod](https://github.com/golang/go/wiki/Modules):
+
+```
 go get go.uber.org/fx@v1
 ```
 
-## Getting started
-
-To get started with Fx, [start here](https://uber-go.github.io/fx/get-started/).
+Or by using [dep](https://github.com/golang/dep):
+```
+dep ensure -add go.uber.org/fx@1.0.0
+```
 
 ## Stability
 
-This library is `v1` and follows [SemVer](https://semver.org/) strictly.
+This library is `v1` and follows [SemVer](http://semver.org/) strictly.
 
 No breaking changes will be made to exported APIs before `v2.0.0`.
 
-This project follows the [Go Release Policy](https://golang.org/doc/devel/release.html#policy). Each major
+This project follows the [Go Release Policy][release-policy]. Each major
 version of Go is supported until there are two newer major releases.
 
-## Stargazers over time
+[doc-img]: http://img.shields.io/badge/GoDoc-Reference-blue.svg
+[doc]: https://godoc.org/go.uber.org/fx
 
-[![Stargazers over time](https://starchart.cc/uber-go/fx.svg)](https://starchart.cc/uber-go/fx)
+[release-img]: https://img.shields.io/github/release/uber-go/fx.svg
+[release]: https://github.com/uber-go/fx/releases
 
+[ci-img]: https://github.com/uber-go/fx/actions/workflows/go.yml/badge.svg
+[ci]: https://github.com/uber-go/fx/actions/workflows/go.yml
+
+[cov-img]: https://codecov.io/gh/uber-go/fx/branch/master/graph/badge.svg
+[cov]: https://codecov.io/gh/uber-go/fx/branch/master
+
+[report-card-img]: https://goreportcard.com/badge/github.com/uber-go/fx
+[report-card]: https://goreportcard.com/report/github.com/uber-go/fx
+
+[release-policy]: https://golang.org/doc/devel/release.html#policy

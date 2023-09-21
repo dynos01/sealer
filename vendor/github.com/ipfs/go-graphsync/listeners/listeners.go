@@ -2,7 +2,7 @@ package listeners
 
 import (
 	"github.com/hannahhoward/go-pubsub"
-	peer "github.com/libp2p/go-libp2p/core/peer"
+	peer "github.com/libp2p/go-libp2p-core/peer"
 
 	"github.com/ipfs/go-graphsync"
 )
@@ -72,37 +72,37 @@ func (rcl *RequestorCancelledListeners) NotifyCancelledListeners(p peer.ID, requ
 	_ = rcl.pubSub.Publish(internalRequestorCancelledEvent{p, request})
 }
 
-// RequestProcessingListeners is a set of listeners for when requests begin processing
-type RequestProcessingListeners struct {
+// OutgoingRequestProcessingListeners is a set of listeners for when requests begin processing
+type OutgoingRequestProcessingListeners struct {
 	pubSub *pubsub.PubSub
 }
 
-type internalRequestProcessingEvent struct {
+type internalOutgoingRequestProcessingEvent struct {
 	p                      peer.ID
 	request                graphsync.RequestData
 	inProgressRequestCount int
 }
 
-func requestProcessingDispatcher(event pubsub.Event, subscriberFn pubsub.SubscriberFn) error {
-	ie := event.(internalRequestProcessingEvent)
-	listener := subscriberFn.(graphsync.OnRequestProcessingListener)
+func outgoingRequestProcessingDispatcher(event pubsub.Event, subscriberFn pubsub.SubscriberFn) error {
+	ie := event.(internalOutgoingRequestProcessingEvent)
+	listener := subscriberFn.(graphsync.OnOutgoingRequestProcessingListener)
 	listener(ie.p, ie.request, ie.inProgressRequestCount)
 	return nil
 }
 
-// NewRequestProcessingListeners returns a new list of listeners for when requestors cancel
-func NewRequestProcessingListeners() *RequestProcessingListeners {
-	return &RequestProcessingListeners{pubSub: pubsub.New(requestProcessingDispatcher)}
+// NewOutgoingRequestProcessingListeners returns a new list of listeners for when requestors cancel
+func NewOutgoingRequestProcessingListeners() *OutgoingRequestProcessingListeners {
+	return &OutgoingRequestProcessingListeners{pubSub: pubsub.New(outgoingRequestProcessingDispatcher)}
 }
 
-// Register registers an listener for responses that are processing
-func (rpl *RequestProcessingListeners) Register(listener graphsync.OnRequestProcessingListener) graphsync.UnregisterHookFunc {
-	return graphsync.UnregisterHookFunc(rpl.pubSub.Subscribe(listener))
+// Register registers an listener for completed responses
+func (bsl *OutgoingRequestProcessingListeners) Register(listener graphsync.OnOutgoingRequestProcessingListener) graphsync.UnregisterHookFunc {
+	return graphsync.UnregisterHookFunc(bsl.pubSub.Subscribe(listener))
 }
 
-// NotifyRequestProcessingListeners notifies all listeners that a requestor cancelled a response
-func (rpl *RequestProcessingListeners) NotifyRequestProcessingListeners(p peer.ID, request graphsync.RequestData, inProgressRequestCount int) {
-	_ = rpl.pubSub.Publish(internalRequestProcessingEvent{p, request, inProgressRequestCount})
+// NotifyOutgoingRequestProcessingListeners notifies all listeners that a requestor cancelled a response
+func (bsl *OutgoingRequestProcessingListeners) NotifyOutgoingRequestProcessingListeners(p peer.ID, request graphsync.RequestData, inProgressRequestCount int) {
+	_ = bsl.pubSub.Publish(internalOutgoingRequestProcessingEvent{p, request, inProgressRequestCount})
 }
 
 // BlockSentListeners is a set of listeners for when requestors cancel

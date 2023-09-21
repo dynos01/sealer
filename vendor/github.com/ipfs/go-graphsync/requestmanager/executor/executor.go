@@ -5,18 +5,16 @@ import (
 	"context"
 	"sync/atomic"
 
+	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/ipfs/go-peertaskqueue/peertask"
-	"github.com/ipld/go-ipld-prime/datamodel"
-	"github.com/ipld/go-ipld-prime/linking"
+	"github.com/ipld/go-ipld-prime"
+	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
 	"github.com/ipld/go-ipld-prime/traversal"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
+	"github.com/libp2p/go-libp2p-core/peer"
 
 	"github.com/ipfs/go-graphsync"
-	"github.com/ipfs/go-graphsync/donotsendfirstblocks"
+	"github.com/ipfs/go-graphsync/cidset"
 	"github.com/ipfs/go-graphsync/ipldutil"
 	gsmsg "github.com/ipfs/go-graphsync/message"
 	"github.com/ipfs/go-graphsync/requestmanager/hooks"
@@ -37,12 +35,9 @@ type BlockHooks interface {
 	ProcessBlockHooks(p peer.ID, response graphsync.ResponseData, block graphsync.BlockData) hooks.UpdateResult
 }
 
-// ReconciledLoader is an interface that can be used to load blocks from a local store or a remote request
-type ReconciledLoader interface {
-	SetRemoteOnline(online bool)
-	RetryLastLoad() types.AsyncLoadResult
-	BlockReadOpener(lctx linking.LinkContext, link datamodel.Link) types.AsyncLoadResult
-}
+// AsyncLoadFn is a function which given a request id and an ipld.Link, returns
+// a channel which will eventually return data for the link or an err
+type AsyncLoadFn func(peer.ID, graphsync.RequestID, ipld.Link, ipld.LinkContext) <-chan types.AsyncLoadResult
 
 // Executor handles actually executing graphsync requests and verifying them.
 // It has control of requests when they are in the "running" state, while
@@ -50,15 +45,18 @@ type ReconciledLoader interface {
 type Executor struct {
 	manager    Manager
 	blockHooks BlockHooks
+	loader     AsyncLoadFn
 }
 
 // NewExecutor returns a new executor
 func NewExecutor(
 	manager Manager,
-	blockHooks BlockHooks) *Executor {
+	blockHooks BlockHooks,
+	loader AsyncLoadFn) *Executor {
 	return &Executor{
 		manager:    manager,
 		blockHooks: blockHooks,
+		loader:     loader,
 	}
 }
 
@@ -75,23 +73,14 @@ func (e *Executor) ExecuteTask(ctx context.Context, pid peer.ID, task *peertask.
 		log.Info("Empty task on peer request stack")
 		return false
 	}
-
-	_, span := otel.Tracer("graphsync").Start(trace.ContextWithSpan(ctx, requestTask.Span), "executeTask")
-	defer span.End()
-
 	log.Debugw("beginning request execution", "id", requestTask.Request.ID(), "peer", pid.String(), "root_cid", requestTask.Request.Root().String())
 	err := e.traverse(requestTask)
-	if err != nil {
-		span.RecordError(err)
-		if !ipldutil.IsContextCancelErr(err) {
-			e.manager.SendRequest(requestTask.P, gsmsg.NewCancelRequest(requestTask.Request.ID()))
-			requestTask.ReconciledLoader.SetRemoteOnline(false)
-			if !isPausedErr(err) {
-				span.SetStatus(codes.Error, err.Error())
-				select {
-				case <-requestTask.Ctx.Done():
-				case requestTask.InProgressErr <- err:
-				}
+	if err != nil && !ipldutil.IsContextCancelErr(err) {
+		e.manager.SendRequest(requestTask.P, gsmsg.CancelRequest(requestTask.Request.ID()))
+		if !isPausedErr(err) {
+			select {
+			case <-requestTask.Ctx.Done():
+			case requestTask.InProgressErr <- err:
 			}
 		}
 	}
@@ -102,22 +91,26 @@ func (e *Executor) ExecuteTask(ctx context.Context, pid peer.ID, task *peertask.
 
 // RequestTask are parameters for a single request execution
 type RequestTask struct {
-	Ctx                  context.Context
-	Span                 trace.Span
-	Request              gsmsg.GraphSyncRequest
-	LastResponse         *atomic.Value
-	DoNotSendFirstBlocks int64
-	PauseMessages        <-chan struct{}
-	Traverser            ipldutil.Traverser
-	P                    peer.ID
-	InProgressErr        chan error
-	Empty                bool
-	ReconciledLoader     ReconciledLoader
+	Ctx            context.Context
+	Request        gsmsg.GraphSyncRequest
+	LastResponse   *atomic.Value
+	DoNotSendCids  *cid.Set
+	PauseMessages  <-chan struct{}
+	Traverser      ipldutil.Traverser
+	P              peer.ID
+	InProgressErr  chan error
+	Empty          bool
+	InitialRequest bool
 }
 
 func (e *Executor) traverse(rt RequestTask) error {
-	requestSent := false
+	onlyOnce := &onlyOnce{e, rt, false}
 	// for initial request, start remote right away
+	if rt.InitialRequest {
+		if err := onlyOnce.startRemoteRequest(); err != nil {
+			return err
+		}
+	}
 	for {
 		// check if traversal is complete
 		isComplete, err := rt.Traverser.IsComplete()
@@ -128,20 +121,23 @@ func (e *Executor) traverse(rt RequestTask) error {
 		lnk, linkContext := rt.Traverser.CurrentRequest()
 		// attempt to load
 		log.Debugf("will load link=%s", lnk)
-		result := rt.ReconciledLoader.BlockReadOpener(linkContext, lnk)
-		// if we've only loaded locally so far and hit a missing block
-		// initiate remote request and retry the load operation from remote
-		if _, ok := result.Err.(graphsync.RemoteMissingBlockErr); ok && !requestSent {
-			requestSent = true
-
-			// tell the loader we're online now
-			rt.ReconciledLoader.SetRemoteOnline(true)
-
-			if err := e.startRemoteRequest(rt); err != nil {
+		resultChan := e.loader(rt.P, rt.Request.ID(), lnk, linkContext)
+		var result types.AsyncLoadResult
+		// check for immediate result
+		select {
+		case result = <-resultChan:
+		default:
+			// if no immediate result
+			// initiate remote request if not already sent (we want to fill out the doNotSendCids on a resume)
+			if err := onlyOnce.startRemoteRequest(); err != nil {
 				return err
 			}
-			// retry the load
-			result = rt.ReconciledLoader.RetryLastLoad()
+			// wait for block result
+			select {
+			case <-rt.Ctx.Done():
+				return ipldutil.ContextCancelError{}
+			case result = <-resultChan:
+			}
 		}
 		log.Debugf("successfully loaded link=%s, nBlocksRead=%d", lnk, rt.Traverser.NBlocksTraversed())
 		// advance the traversal based on results
@@ -161,13 +157,14 @@ func (e *Executor) traverse(rt RequestTask) error {
 func (e *Executor) processBlockHooks(p peer.ID, response graphsync.ResponseData, block graphsync.BlockData) error {
 	result := e.blockHooks.ProcessBlockHooks(p, response, block)
 	if len(result.Extensions) > 0 {
-		updateRequest := gsmsg.NewUpdateRequest(response.RequestID(), result.Extensions...)
+		updateRequest := gsmsg.UpdateRequest(response.RequestID(), result.Extensions...)
 		e.manager.SendRequest(p, updateRequest)
 	}
 	return result.Err
 }
 
 func (e *Executor) onNewBlock(rt RequestTask, block graphsync.BlockData) error {
+	rt.DoNotSendCids.Add(block.Link().(cidlink.Link).Cid)
 	response := rt.LastResponse.Load().(gsmsg.GraphSyncResponse)
 	return e.processBlockHooks(rt.P, response, block)
 }
@@ -184,22 +181,15 @@ func (e *Executor) advanceTraversal(rt RequestTask, result types.AsyncLoadResult
 		case <-rt.Ctx.Done():
 			return ipldutil.ContextCancelError{}
 		case rt.InProgressErr <- result.Err:
-			if _, ok := result.Err.(graphsync.RemoteMissingBlockErr); ok {
-				rt.Traverser.Error(traversal.SkipMe{})
-			} else {
-				rt.Traverser.Error(result.Err)
-			}
+			rt.Traverser.Error(traversal.SkipMe{})
 			return nil
 		}
 	}
 	return rt.Traverser.Advance(bytes.NewBuffer(result.Data))
 }
 
-func (e *Executor) processResult(rt RequestTask, link datamodel.Link, result types.AsyncLoadResult) error {
-	var err error
-	if result.Err == nil {
-		err = e.onNewBlock(rt, &blockData{link, result.Local, uint64(len(result.Data)), int64(rt.Traverser.NBlocksTraversed())})
-	}
+func (e *Executor) processResult(rt RequestTask, link ipld.Link, result types.AsyncLoadResult) error {
+	err := e.onNewBlock(rt, &blockData{link, result.Local, uint64(len(result.Data)), int64(rt.Traverser.NBlocksTraversed())})
 	select {
 	case <-rt.PauseMessages:
 		if err == nil {
@@ -212,13 +202,12 @@ func (e *Executor) processResult(rt RequestTask, link datamodel.Link, result typ
 
 func (e *Executor) startRemoteRequest(rt RequestTask) error {
 	request := rt.Request
-	doNotSendFirstBlocks := rt.DoNotSendFirstBlocks
-	if doNotSendFirstBlocks < int64(rt.Traverser.NBlocksTraversed()) {
-		doNotSendFirstBlocks = int64(rt.Traverser.NBlocksTraversed())
-	}
-	if doNotSendFirstBlocks > 0 {
-		doNotSendFirstBlocksData := donotsendfirstblocks.EncodeDoNotSendFirstBlocks(doNotSendFirstBlocks)
-		request = rt.Request.ReplaceExtensions([]graphsync.ExtensionData{{Name: graphsync.ExtensionsDoNotSendFirstBlocks, Data: doNotSendFirstBlocksData}})
+	if rt.DoNotSendCids.Len() > 0 {
+		cidsData, err := cidset.EncodeCidSet(rt.DoNotSendCids)
+		if err != nil {
+			return err
+		}
+		request = rt.Request.ReplaceExtensions([]graphsync.ExtensionData{{Name: graphsync.ExtensionDoNotSendCIDs, Data: cidsData}})
 	}
 	log.Debugw("starting remote request", "id", rt.Request.ID(), "peer", rt.P.String(), "root_cid", rt.Request.Root().String())
 	e.manager.SendRequest(rt.P, request)
@@ -230,15 +219,29 @@ func isPausedErr(err error) bool {
 	return isPaused
 }
 
+type onlyOnce struct {
+	e           *Executor
+	rt          RequestTask
+	requestSent bool
+}
+
+func (so *onlyOnce) startRemoteRequest() error {
+	if so.requestSent {
+		return nil
+	}
+	so.requestSent = true
+	return so.e.startRemoteRequest(so.rt)
+}
+
 type blockData struct {
-	link  datamodel.Link
+	link  ipld.Link
 	local bool
 	size  uint64
 	index int64
 }
 
 // Link is the link/cid for the block
-func (bd *blockData) Link() datamodel.Link {
+func (bd *blockData) Link() ipld.Link {
 	return bd.link
 }
 

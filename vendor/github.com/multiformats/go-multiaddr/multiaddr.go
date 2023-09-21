@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"log"
 	"strings"
-
-	"golang.org/x/exp/slices"
 )
 
 // multiaddr is the data structure representing a Multiaddr
@@ -201,35 +199,4 @@ addrloop:
 		b = append(b, addr)
 	}
 	return b
-}
-
-// Contains reports whether addr is contained in addrs.
-func Contains(addrs []Multiaddr, addr Multiaddr) bool {
-	for _, a := range addrs {
-		if addr.Equal(a) {
-			return true
-		}
-	}
-	return false
-}
-
-// Unique deduplicates addresses in place, leave only unique addresses.
-// It doesn't allocate.
-func Unique(addrs []Multiaddr) []Multiaddr {
-	if len(addrs) == 0 {
-		return addrs
-	}
-	// Use the new slices package here, as the sort function doesn't allocate (sort.Slice does).
-	slices.SortFunc(addrs, func(a, b Multiaddr) bool { return bytes.Compare(a.Bytes(), b.Bytes()) < 0 })
-	idx := 1
-	for i := 1; i < len(addrs); i++ {
-		if !addrs[i-1].Equal(addrs[i]) {
-			addrs[idx] = addrs[i]
-			idx++
-		}
-	}
-	for i := idx; i < len(addrs); i++ {
-		addrs[i] = nil
-	}
-	return addrs[:idx]
 }

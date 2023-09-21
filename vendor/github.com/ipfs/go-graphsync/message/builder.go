@@ -7,27 +7,33 @@ import (
 	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
 
 	"github.com/ipfs/go-graphsync"
+	"github.com/ipfs/go-graphsync/metadata"
 )
 
 // Builder captures components of a message across multiple
 // requests for a given peer and then generates the corresponding
 // GraphSync message when ready to send
 type Builder struct {
+	topic              Topic
 	outgoingBlocks     map[cid.Cid]blocks.Block
 	blkSize            uint64
 	completedResponses map[graphsync.RequestID]graphsync.ResponseStatusCode
-	outgoingResponses  map[graphsync.RequestID][]GraphSyncLinkMetadatum
+	outgoingResponses  map[graphsync.RequestID]metadata.Metadata
 	extensions         map[graphsync.RequestID][]graphsync.ExtensionData
 	requests           map[graphsync.RequestID]GraphSyncRequest
 }
 
+// Topic is an identifier for notifications about this response builder
+type Topic uint64
+
 // NewBuilder generates a new Builder.
-func NewBuilder() *Builder {
+func NewBuilder(topic Topic) *Builder {
 	return &Builder{
+		topic:              topic,
 		requests:           make(map[graphsync.RequestID]GraphSyncRequest),
 		outgoingBlocks:     make(map[cid.Cid]blocks.Block),
 		completedResponses: make(map[graphsync.RequestID]graphsync.ResponseStatusCode),
-		outgoingResponses:  make(map[graphsync.RequestID][]GraphSyncLinkMetadatum),
+		outgoingResponses:  make(map[graphsync.RequestID]metadata.Metadata),
 		extensions:         make(map[graphsync.RequestID][]graphsync.ExtensionData),
 	}
 }
@@ -60,8 +66,8 @@ func (b *Builder) BlockSize() uint64 {
 
 // AddLink adds the given link and whether its block is present
 // to the message for the given request ID.
-func (b *Builder) AddLink(requestID graphsync.RequestID, link ipld.Link, linkAction graphsync.LinkAction) {
-	b.outgoingResponses[requestID] = append(b.outgoingResponses[requestID], GraphSyncLinkMetadatum{Link: link.(cidlink.Link).Cid, Action: linkAction})
+func (b *Builder) AddLink(requestID graphsync.RequestID, link ipld.Link, blockPresent bool) {
+	b.outgoingResponses[requestID] = append(b.outgoingResponses[requestID], metadata.Item{Link: link.(cidlink.Link).Cid, BlockPresent: blockPresent})
 }
 
 // AddResponseCode marks the given request as completed in the message,
@@ -81,41 +87,29 @@ func (b *Builder) Empty() bool {
 	return len(b.requests) == 0 && len(b.outgoingBlocks) == 0 && len(b.outgoingResponses) == 0
 }
 
-// ScrubResponse removes a response from a message and any blocks only referenced by that response
-func (b *Builder) ScrubResponses(requestIDs []graphsync.RequestID) uint64 {
-	for _, requestID := range requestIDs {
-		delete(b.completedResponses, requestID)
-		delete(b.extensions, requestID)
-		delete(b.outgoingResponses, requestID)
-	}
-	oldSize := b.blkSize
-	newBlkSize := uint64(0)
-	savedBlocks := make(map[cid.Cid]blocks.Block, len(b.outgoingBlocks))
-	for _, metadata := range b.outgoingResponses {
-		for _, item := range metadata {
-			block, willSendBlock := b.outgoingBlocks[item.Link]
-			_, alreadySavedBlock := savedBlocks[item.Link]
-			if item.Action == graphsync.LinkActionPresent && willSendBlock && !alreadySavedBlock {
-				savedBlocks[item.Link] = block
-				newBlkSize += uint64(len(block.RawData()))
-			}
-		}
-	}
-	b.blkSize = newBlkSize
-	b.outgoingBlocks = savedBlocks
-	return oldSize - newBlkSize
-}
-
 // Build assembles and encodes message data from the added requests, links, and blocks.
 func (b *Builder) Build() (GraphSyncMessage, error) {
 	responses := make(map[graphsync.RequestID]GraphSyncResponse, len(b.outgoingResponses))
 	for requestID, linkMap := range b.outgoingResponses {
+		mdRaw, err := metadata.EncodeMetadata(linkMap)
+		if err != nil {
+			return GraphSyncMessage{}, err
+		}
+		b.extensions[requestID] = append(b.extensions[requestID], graphsync.ExtensionData{
+			Name: graphsync.ExtensionMetadata,
+			Data: mdRaw,
+		})
 		status, isComplete := b.completedResponses[requestID]
-		responses[requestID] = NewResponse(requestID, responseCode(status, isComplete), linkMap, b.extensions[requestID]...)
+		responses[requestID] = NewResponse(requestID, responseCode(status, isComplete), b.extensions[requestID]...)
 	}
 	return GraphSyncMessage{
 		b.requests, responses, b.outgoingBlocks,
 	}, nil
+}
+
+// Topic returns the identifier for notifications sent about this builder
+func (b *Builder) Topic() Topic {
+	return b.topic
 }
 
 func responseCode(status graphsync.ResponseStatusCode, isComplete bool) graphsync.ResponseStatusCode {

@@ -6,7 +6,6 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -23,36 +22,9 @@ const (
 
 var defaultTTL uint32 = 3200
 
-type serverOpts struct {
-	ttl uint32
-}
-
-func applyServerOpts(options ...ServerOption) serverOpts {
-	// Apply default configuration and load supplied options.
-	var conf = serverOpts{
-		ttl: defaultTTL,
-	}
-	for _, o := range options {
-		if o != nil {
-			o(&conf)
-		}
-	}
-	return conf
-}
-
-// ServerOption fills the option struct.
-type ServerOption func(*serverOpts)
-
-// TTL sets the TTL for DNS replies.
-func TTL(ttl uint32) ServerOption {
-	return func(o *serverOpts) {
-		o.ttl = ttl
-	}
-}
-
 // Register a service by given arguments. This call will take the system's hostname
 // and lookup IP by that hostname.
-func Register(instance, service, domain string, port int, text []string, ifaces []net.Interface, opts ...ServerOption) (*Server, error) {
+func Register(instance, service, domain string, port int, text []string, ifaces []net.Interface) (*Server, error) {
 	entry := newServiceEntry(instance, service, domain)
 	entry.Port = port
 	entry.Text = text
@@ -96,7 +68,7 @@ func Register(instance, service, domain string, port int, text []string, ifaces 
 		return nil, fmt.Errorf("could not determine host IP addresses")
 	}
 
-	s, err := newServer(ifaces, applyServerOpts(opts...))
+	s, err := newServer(ifaces)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +81,7 @@ func Register(instance, service, domain string, port int, text []string, ifaces 
 
 // RegisterProxy registers a service proxy. This call will skip the hostname/IP lookup and
 // will use the provided values.
-func RegisterProxy(instance, service, domain string, port int, host string, ips []string, text []string, ifaces []net.Interface, opts ...ServerOption) (*Server, error) {
+func RegisterProxy(instance, service, domain string, port int, host string, ips []string, text []string, ifaces []net.Interface) (*Server, error) {
 	entry := newServiceEntry(instance, service, domain)
 	entry.Port = port
 	entry.Text = text
@@ -152,7 +124,7 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 		ifaces = listMulticastInterfaces()
 	}
 
-	s, err := newServer(ifaces, applyServerOpts(opts...))
+	s, err := newServer(ifaces)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +154,7 @@ type Server struct {
 }
 
 // Constructs server structure
-func newServer(ifaces []net.Interface, opts serverOpts) (*Server, error) {
+func newServer(ifaces []net.Interface) (*Server, error) {
 	ipv4conn, err4 := joinUdp4Multicast(ifaces)
 	if err4 != nil {
 		log.Printf("[zeroconf] no suitable IPv4 interface: %s", err4.Error())
@@ -200,7 +172,7 @@ func newServer(ifaces []net.Interface, opts serverOpts) (*Server, error) {
 		ipv4conn:       ipv4conn,
 		ipv6conn:       ipv6conn,
 		ifaces:         ifaces,
-		ttl:            opts.ttl,
+		ttl:            defaultTTL,
 		shouldShutdown: make(chan struct{}),
 	}
 
@@ -227,8 +199,6 @@ func (s *Server) SetText(text []string) {
 }
 
 // TTL sets the TTL for DNS replies
-//
-// Deprecated: This method is racy. Use the TTL server option instead.
 func (s *Server) TTL(ttl uint32) {
 	s.ttl = ttl
 }
@@ -765,62 +735,26 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 		return fmt.Errorf("failed to pack msg %v: %w", msg, err)
 	}
 	if s.ipv4conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv4#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
 		var wcm ipv4.ControlMessage
 		if ifIndex != 0 {
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = ifIndex
-			default:
-				iface, _ := net.InterfaceByIndex(ifIndex)
-				if err := s.ipv4conn.SetMulticastInterface(iface); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-				}
-			}
+			wcm.IfIndex = ifIndex
 			s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
 		} else {
 			for _, intf := range s.ifaces {
-				switch runtime.GOOS {
-				case "darwin", "ios", "linux":
-					wcm.IfIndex = intf.Index
-				default:
-					if err := s.ipv4conn.SetMulticastInterface(&intf); err != nil {
-						log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-					}
-				}
+				wcm.IfIndex = intf.Index
 				s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
 			}
 		}
 	}
 
 	if s.ipv6conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv6#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
 		var wcm ipv6.ControlMessage
 		if ifIndex != 0 {
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = ifIndex
-			default:
-				iface, _ := net.InterfaceByIndex(ifIndex)
-				if err := s.ipv6conn.SetMulticastInterface(iface); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-				}
-			}
+			wcm.IfIndex = ifIndex
 			s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
 		} else {
 			for _, intf := range s.ifaces {
-				switch runtime.GOOS {
-				case "darwin", "ios", "linux":
-					wcm.IfIndex = intf.Index
-				default:
-					if err := s.ipv6conn.SetMulticastInterface(&intf); err != nil {
-						log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-					}
-				}
+				wcm.IfIndex = intf.Index
 				s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
 			}
 		}

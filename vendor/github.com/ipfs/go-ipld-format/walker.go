@@ -116,9 +116,6 @@ type NavigableNode interface {
 	// ChildTotal returns the number of children of the `ActiveNode`.
 	ChildTotal() uint
 
-	// GetIPLDNode returns actual IPLD Node
-	GetIPLDNode() Node
-
 	// TODO: Evaluate providing the `Cleanup` and `Reset` methods.
 
 	// Cleanup is an optional method that is called by the `Walker` when
@@ -165,8 +162,6 @@ var errUpOnRoot = errors.New("can't go up, already on root")
 
 // EndOfDag wraps the `errUpOnRoot` and signals to the user that the
 // entire DAG has been iterated.
-//
-//lint:ignore ST1012 // This is roughly equivalent to io.EOF.
 var EndOfDag = errors.New("end of DAG")
 
 // ErrNextNoChild signals the end of this parent child nodes.

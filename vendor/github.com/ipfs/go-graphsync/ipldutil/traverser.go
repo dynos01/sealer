@@ -4,16 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
-	"sync"
 
-	dagpb "github.com/ipld/go-codec-dagpb"
 	"github.com/ipld/go-ipld-prime"
 	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
-	"github.com/ipld/go-ipld-prime/node/basicnode"
 	"github.com/ipld/go-ipld-prime/traversal"
 	"github.com/ipld/go-ipld-prime/traversal/selector"
-
-	"github.com/ipfs/go-graphsync/panics"
 )
 
 /* TODO: This traverser creates an extra go-routine and is quite complicated, in order to give calling code control of
@@ -24,7 +19,7 @@ can go away */
 
 var defaultLinkSystem = cidlink.DefaultLinkSystem()
 
-func defaultVisitor(traversal.Progress, ipld.Node, traversal.VisitReason) error { return nil }
+var defaultVisitor traversal.AdvVisitFn = func(traversal.Progress, ipld.Node, traversal.VisitReason) error { return nil }
 
 // ContextCancelError is a sentinel that indicates the passed in context
 // was cancelled
@@ -42,45 +37,36 @@ func IsContextCancelErr(err error) bool {
 
 // TraversalBuilder defines parameters for an iterative traversal
 type TraversalBuilder struct {
-	Root          ipld.Link
-	Selector      ipld.Node
-	Visitor       traversal.AdvVisitFn
-	LinkSystem    ipld.LinkSystem
-	Chooser       traversal.LinkTargetNodePrototypeChooser
-	Budget        *traversal.Budget
-	PanicCallback panics.CallBackFn
+	Root       ipld.Link
+	Selector   ipld.Node
+	Visitor    traversal.AdvVisitFn
+	LinkSystem ipld.LinkSystem
+	Chooser    traversal.LinkTargetNodePrototypeChooser
+	Budget     *traversal.Budget
 }
 
 // Traverser is an interface for performing a selector traversal that operates iteratively --
 // it stops and waits for a manual load every time a block boundary is encountered
 type Traverser interface {
-	// IsComplete returns the completion state (boolean) and if so, the final
-	// error result from IPLD.
-	//
-	// Note that CurrentRequest will block if the traverser is performing an
-	// IPLD load.
+	// IsComplete returns the completion state (boolean) and if so, the final error result from IPLD
 	IsComplete() (bool, error)
-
-	// CurrentRequest returns the parameters for the current block load waiting
-	// to be fulfilled in order to advance further.
-	//
-	// Note that CurrentRequest will block if the traverser is performing an
-	// IPLD load.
+	// Current request returns the current link waiting to be loaded
 	CurrentRequest() (ipld.Link, ipld.LinkContext)
-
-	// Advance advances the traversal successfully by supplying the given reader
-	// as the result of the next IPLD load.
+	// Advance advances the traversal successfully by supplying the given reader as the result of the next IPLD load
 	Advance(reader io.Reader) error
-
-	// Error errors the traversal by returning the given error as the result of
-	// the next IPLD load.
+	// Error errors the traversal by returning the given error as the result of the next IPLD load
 	Error(err error)
-
 	// Shutdown cancels the traversal
 	Shutdown(ctx context.Context)
-
 	// NBlocksTraversed returns the number of blocks successfully traversed
 	NBlocksTraversed() int
+}
+
+type state struct {
+	isDone         bool
+	completionErr  error
+	currentLink    ipld.Link
+	currentContext ipld.LinkContext
 }
 
 type nextResponse struct {
@@ -93,25 +79,26 @@ type nextResponse struct {
 func (tb TraversalBuilder) Start(parentCtx context.Context) Traverser {
 	ctx, cancel := context.WithCancel(parentCtx)
 	t := &traverser{
+		blocksCount:  0,
+		parentCtx:    parentCtx,
 		ctx:          ctx,
 		cancel:       cancel,
 		root:         tb.Root,
 		selector:     tb.Selector,
+		visitor:      defaultVisitor,
+		chooser:      defaultChooser,
 		linkSystem:   tb.LinkSystem,
 		budget:       tb.Budget,
+		awaitRequest: make(chan struct{}, 1),
+		stateChan:    make(chan state, 1),
 		responses:    make(chan nextResponse),
 		stopped:      make(chan struct{}),
-		panicHandler: panics.MakeHandler(tb.PanicCallback),
 	}
 	if tb.Visitor != nil {
 		t.visitor = tb.Visitor
-	} else {
-		t.visitor = defaultVisitor
 	}
 	if tb.Chooser != nil {
 		t.chooser = tb.Chooser
-	} else {
-		t.chooser = dagpb.AddSupportToChooser(basicnode.Chooser)
 	}
 	if tb.LinkSystem.DecoderChooser == nil {
 		t.linkSystem.DecoderChooser = defaultLinkSystem.DecoderChooser
@@ -130,35 +117,24 @@ func (tb TraversalBuilder) Start(parentCtx context.Context) Traverser {
 // traverser is a class to perform a selector traversal that stops every time a new block is loaded
 // and waits for manual input (in the form of advance or error)
 type traverser struct {
-	blocksCount  int
-	ctx          context.Context
-	cancel       context.CancelFunc
-	root         ipld.Link
-	selector     ipld.Node
-	visitor      traversal.AdvVisitFn
-	linkSystem   ipld.LinkSystem
-	chooser      traversal.LinkTargetNodePrototypeChooser
-	budget       *traversal.Budget
-	panicHandler panics.PanicHandler
-
-	// stateMu is held while a block is being loaded.
-	// It is released when a StorageReadOpener callback is received,
-	// so that the user can inspect the state and use Advance or Error.
-	// Advance/Error grab the mutex and let StorageReadOpener return.
-	// The four state fields are only safe to read while the mutex isn't held.
-	stateMu        sync.Mutex
-	isDone         bool
-	completionErr  error
+	blocksCount    int
+	parentCtx      context.Context
+	ctx            context.Context
+	cancel         context.CancelFunc
+	root           ipld.Link
+	selector       ipld.Node
+	visitor        traversal.AdvVisitFn
+	linkSystem     ipld.LinkSystem
+	chooser        traversal.LinkTargetNodePrototypeChooser
 	currentLink    ipld.Link
 	currentContext ipld.LinkContext
-
-	// responses blocks LinkSystem block loads (in the method "loader")
-	// until the next Advance or Error method call.
-	responses chan nextResponse
-
-	// stopped is closed when the traverser is stopped,
-	// due to being finishing, cancelled, or shut down.
-	stopped chan struct{}
+	budget         *traversal.Budget
+	isDone         bool
+	completionErr  error
+	awaitRequest   chan struct{}
+	stateChan      chan state
+	responses      chan nextResponse
+	stopped        chan struct{}
 }
 
 func (t *traverser) NBlocksTraversed() int {
@@ -166,48 +142,52 @@ func (t *traverser) NBlocksTraversed() int {
 }
 
 func (t *traverser) loader(lnkCtx ipld.LinkContext, lnk ipld.Link) (io.Reader, error) {
-	// A StorageReadOpener call came in; update the state and release the lock.
-	// We can't simply unlock the mutex inside the <-t.responses case,
-	// as then we'd deadlock with the other side trying to send.
-	// The other side can't lock after sending to t.responses,
-	// as otherwise the load might start before the mutex is held.
-	t.currentLink = lnk
-	t.currentContext = lnkCtx
-	t.stateMu.Unlock()
-
 	select {
 	case <-t.ctx.Done():
-		// We got cancelled, so we won't load this block via the responses chan.
-		// Lock the mutex again, until writeDone gives the user their final error.
-		t.stateMu.Lock()
+		return nil, ContextCancelError{}
+	case t.stateChan <- state{false, nil, lnk, lnkCtx}:
+	}
+	select {
+	case <-t.ctx.Done():
 		return nil, ContextCancelError{}
 	case response := <-t.responses:
 		return response.input, response.err
 	}
 }
 
-func (t *traverser) writeDone(err error) {
-	t.isDone = true
-	t.completionErr = err
-	t.currentContext = ipld.LinkContext{Ctx: t.ctx}
+func (t *traverser) checkState() {
+	select {
+	case <-t.awaitRequest:
+		select {
+		case <-t.ctx.Done():
+			t.isDone = true
+			t.completionErr = ContextCancelError{}
+		case newState := <-t.stateChan:
+			t.isDone = newState.isDone
+			t.completionErr = newState.completionErr
+			t.currentLink = newState.currentLink
+			t.currentContext = newState.currentContext
+		}
+	default:
+	}
+}
 
-	// The traversal is done, so there won't be another StorageReadOpener call.
-	// Unlock the state so the user can use IsComplete etc.
-	t.stateMu.Unlock()
+func (t *traverser) writeDone(err error) {
+	select {
+	case <-t.ctx.Done():
+	case t.stateChan <- state{true, err, nil, ipld.LinkContext{Ctx: t.ctx}}:
+	}
 }
 
 func (t *traverser) start() {
-	// Grab the state mutex until the first StorageReadOpener call comes in.
-	t.stateMu.Lock()
-
+	select {
+	case <-t.ctx.Done():
+		close(t.stopped)
+		return
+	case t.awaitRequest <- struct{}{}:
+	}
 	go func() {
-		defer func() {
-			// catch panics that occur in selector traversal, treat as an errored traversal
-			if err := t.panicHandler(recover()); err != nil {
-				t.writeDone(err)
-			}
-			close(t.stopped)
-		}()
+		defer close(t.stopped)
 		ns, err := t.chooser(t.root, ipld.LinkContext{Ctx: t.ctx})
 		if err != nil {
 			t.writeDone(err)
@@ -243,9 +223,6 @@ func (t *traverser) start() {
 	}()
 }
 
-// Shutdown cancels the traverser's context as passed to Start,
-// and blocks until the traverser is fully stopped
-// or until ctx is cancelled.
 func (t *traverser) Shutdown(ctx context.Context) {
 	t.cancel()
 	select {
@@ -254,60 +231,55 @@ func (t *traverser) Shutdown(ctx context.Context) {
 	}
 }
 
+// IsComplete returns true if a traversal is complete
 func (t *traverser) IsComplete() (bool, error) {
-	// If the state is currently held due to an ongoing block load,
-	// block until it's finished or until the traverser stops,
-	// which then enables us to read the fields directly.
-	t.stateMu.Lock()
-	defer t.stateMu.Unlock()
+	t.checkState()
 	return t.isDone, t.completionErr
 }
 
+// CurrentRequest returns the current block load waiting to be fulfilled in order
+// to advance further
 func (t *traverser) CurrentRequest() (ipld.Link, ipld.LinkContext) {
-	// Just like IsComplete.
-	t.stateMu.Lock()
-	defer t.stateMu.Unlock()
+	t.checkState()
 	return t.currentLink, t.currentContext
 }
 
+// Advance advances the traversal with an io.Reader for the next requested block
 func (t *traverser) Advance(reader io.Reader) error {
-	// Just like IsComplete, block until we're ready to load another block.
-	// We leave it to the other goroutine to unlock the mutex,
-	// once the next StorageReadOpener call comes in or the traversal is done.
-	t.stateMu.Lock()
-
-	if t.isDone {
-		// The other goroutine won't unlock, so we have to unlock.
-		t.stateMu.Unlock()
+	isComplete, _ := t.IsComplete()
+	if isComplete {
 		return errors.New("cannot advance when done")
 	}
 
 	select {
 	case <-t.ctx.Done():
-		// The other goroutine won't unlock, so we have to unlock.
-		t.stateMu.Unlock()
 		return ContextCancelError{}
-	case t.responses <- nextResponse{input: reader}:
+	case t.awaitRequest <- struct{}{}:
+	}
+
+	select {
+	case <-t.ctx.Done():
+		return ContextCancelError{}
+	case t.responses <- nextResponse{reader, nil}:
 	}
 
 	t.blocksCount++
 	return nil
 }
 
+// Error aborts the traversal with an error
 func (t *traverser) Error(err error) {
-	// Just like Advance.
-	t.stateMu.Lock()
-
-	if t.isDone {
-		// The other goroutine won't unlock, so we have to unlock.
-		t.stateMu.Unlock()
+	isComplete, _ := t.IsComplete()
+	if isComplete {
 		return
 	}
-
 	select {
 	case <-t.ctx.Done():
-		// The other goroutine won't unlock, so we have to unlock.
-		t.stateMu.Unlock()
-	case t.responses <- nextResponse{err: err}:
+		return
+	case t.awaitRequest <- struct{}{}:
+	}
+	select {
+	case <-t.ctx.Done():
+	case t.responses <- nextResponse{nil, err}:
 	}
 }

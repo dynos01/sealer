@@ -26,13 +26,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"reflect"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/dig"
 	"go.uber.org/fx/fxevent"
-	"go.uber.org/fx/internal/fxclock"
 	"go.uber.org/fx/internal/fxlog"
 	"go.uber.org/fx/internal/fxreflect"
 	"go.uber.org/fx/internal/lifecycle"
@@ -50,7 +52,113 @@ const DefaultTimeout = 15 * time.Second
 type Option interface {
 	fmt.Stringer
 
-	apply(*module)
+	apply(*App)
+}
+
+// Provide registers any number of constructor functions, teaching the
+// application how to instantiate various types. The supplied constructor
+// function(s) may depend on other types available in the application, must
+// return one or more objects, and may return an error. For example:
+//
+//  // Constructs type *C, depends on *A and *B.
+//  func(*A, *B) *C
+//
+//  // Constructs type *C, depends on *A and *B, and indicates failure by
+//  // returning an error.
+//  func(*A, *B) (*C, error)
+//
+//  // Constructs types *B and *C, depends on *A, and can fail.
+//  func(*A) (*B, *C, error)
+//
+// The order in which constructors are provided doesn't matter, and passing
+// multiple Provide options appends to the application's collection of
+// constructors. Constructors are called only if one or more of their returned
+// types are needed, and their results are cached for reuse (so instances of a
+// type are effectively singletons within an application). Taken together,
+// these properties make it perfectly reasonable to Provide a large number of
+// constructors even if only a fraction of them are used.
+//
+// See the documentation of the In and Out types for advanced features,
+// including optional parameters and named instances.
+//
+// Constructor functions should perform as little external interaction as
+// possible, and should avoid spawning goroutines. Things like server listen
+// loops, background timer loops, and background processing goroutines should
+// instead be managed using Lifecycle callbacks.
+func Provide(constructors ...interface{}) Option {
+	return provideOption{
+		Targets: constructors,
+		Stack:   fxreflect.CallerStack(1, 0),
+	}
+}
+
+type provideOption struct {
+	Targets []interface{}
+	Stack   fxreflect.Stack
+}
+
+func (o provideOption) apply(app *App) {
+	for _, target := range o.Targets {
+		app.provides = append(app.provides, provide{
+			Target: target,
+			Stack:  o.Stack,
+		})
+	}
+}
+
+func (o provideOption) String() string {
+	items := make([]string, len(o.Targets))
+	for i, c := range o.Targets {
+		items[i] = fxreflect.FuncName(c)
+	}
+	return fmt.Sprintf("fx.Provide(%s)", strings.Join(items, ", "))
+}
+
+// Invoke registers functions that are executed eagerly on application start.
+// Arguments for these invocations are built using the constructors registered
+// by Provide. Passing multiple Invoke options appends the new invocations to
+// the application's existing list.
+//
+// Unlike constructors, invocations are always executed, and they're always
+// run in order. Invocations may have any number of returned values. If the
+// final returned object is an error, it's assumed to be a success indicator.
+// All other returned values are discarded.
+//
+// Typically, invoked functions take a handful of high-level objects (whose
+// constructors depend on lower-level objects) and introduce them to each
+// other. This kick-starts the application by forcing it to instantiate a
+// variety of types.
+//
+// To see an invocation in use, read through the package-level example. For
+// advanced features, including optional parameters and named instances, see
+// the documentation of the In and Out types.
+func Invoke(funcs ...interface{}) Option {
+	return invokeOption{
+		Targets: funcs,
+		Stack:   fxreflect.CallerStack(1, 0),
+	}
+}
+
+type invokeOption struct {
+	Targets []interface{}
+	Stack   fxreflect.Stack
+}
+
+func (o invokeOption) apply(app *App) {
+	for _, target := range o.Targets {
+		app.invokes = append(app.invokes, invoke{
+			Target: target,
+			Stack:  o.Stack,
+		})
+	}
+}
+
+func (o invokeOption) String() string {
+	items := make([]string, len(o.Targets))
+	for i, f := range o.Targets {
+		items[i] = fxreflect.FuncName(f)
+	}
+	return fmt.Sprintf("fx.Invoke(%s)", strings.Join(items, ", "))
 }
 
 // Error registers any number of errors with the application to short-circuit
@@ -65,8 +173,8 @@ func Error(errs ...error) Option {
 
 type errorOption []error
 
-func (errs errorOption) apply(mod *module) {
-	mod.app.err = multierr.Append(mod.app.err, multierr.Combine(errs...))
+func (errs errorOption) apply(app *App) {
+	app.err = multierr.Append(app.err, multierr.Combine(errs...))
 }
 
 func (errs errorOption) String() string {
@@ -77,30 +185,30 @@ func (errs errorOption) String() string {
 // packages to bundle sophisticated functionality into easy-to-use Fx modules.
 // For example, a logging package might export a simple option like this:
 //
-//	package logging
+//  package logging
 //
-//	var Module = fx.Provide(func() *log.Logger {
-//	  return log.New(os.Stdout, "", 0)
-//	})
+//  var Module = fx.Provide(func() *log.Logger {
+//    return log.New(os.Stdout, "", 0)
+//  })
 //
 // A shared all-in-one microservice package could then use Options to bundle
 // logging with similar metrics, tracing, and gRPC modules:
 //
-//	package server
+//  package server
 //
-//	var Module = fx.Options(
-//	  logging.Module,
-//	  metrics.Module,
-//	  tracing.Module,
-//	  grpc.Module,
-//	)
+//  var Module = fx.Options(
+//    logging.Module,
+//    metrics.Module,
+//    tracing.Module,
+//    grpc.Module,
+//  )
 //
 // Since this all-in-one module has a minimal API surface, it's easy to add
 // new functionality to it without breaking existing users. Individual
 // applications can take advantage of all this functionality with only one
 // line of code:
 //
-//	app := fx.New(server.Module)
+//  app := fx.New(server.Module)
 //
 // Use this pattern sparingly, since it limits the user's ability to customize
 // their application.
@@ -110,9 +218,9 @@ func Options(opts ...Option) Option {
 
 type optionGroup []Option
 
-func (og optionGroup) apply(mod *module) {
+func (og optionGroup) apply(app *App) {
 	for _, opt := range og {
-		opt.apply(mod)
+		opt.apply(app)
 	}
 }
 
@@ -131,13 +239,8 @@ func StartTimeout(v time.Duration) Option {
 
 type startTimeoutOption time.Duration
 
-func (t startTimeoutOption) apply(m *module) {
-	if m.parent != nil {
-		m.app.err = fmt.Errorf("fx.StartTimeout Option should be passed to top-level App, " +
-			"not to fx.Module")
-	} else {
-		m.app.startTimeout = time.Duration(t)
-	}
+func (t startTimeoutOption) apply(app *App) {
+	app.startTimeout = time.Duration(t)
 }
 
 func (t startTimeoutOption) String() string {
@@ -151,53 +254,27 @@ func StopTimeout(v time.Duration) Option {
 
 type stopTimeoutOption time.Duration
 
-func (t stopTimeoutOption) apply(m *module) {
-	if m.parent != nil {
-		m.app.err = fmt.Errorf("fx.StopTimeout Option should be passed to top-level App, " +
-			"not to fx.Module")
-	} else {
-		m.app.stopTimeout = time.Duration(t)
-	}
+func (t stopTimeoutOption) apply(app *App) {
+	app.stopTimeout = time.Duration(t)
 }
 
 func (t stopTimeoutOption) String() string {
 	return fmt.Sprintf("fx.StopTimeout(%v)", time.Duration(t))
 }
 
-// RecoverFromPanics causes panics that occur in functions given to [Provide],
-// [Decorate], and [Invoke] to be recovered from.
-// This error can be retrieved as any other error, by using (*App).Err().
-func RecoverFromPanics() Option {
-	return recoverFromPanicsOption{}
-}
-
-type recoverFromPanicsOption struct{}
-
-func (o recoverFromPanicsOption) apply(m *module) {
-	if m.parent != nil {
-		m.app.err = fmt.Errorf("fx.RecoverFromPanics Option should be passed to top-level " +
-			"App, not to fx.Module")
-	} else {
-		m.app.recoverFromPanics = true
-	}
-}
-
-func (o recoverFromPanicsOption) String() string {
-	return "fx.RecoverFromPanics()"
-}
-
 // WithLogger specifies how Fx should build an fxevent.Logger to log its events
 // to. The argument must be a constructor with one of the following return
 // types.
 //
-//	fxevent.Logger
-//	(fxevent.Logger, error)
+//   fxevent.Logger
+//   (fxevent.Logger, error)
 //
 // For example,
 //
-//	WithLogger(func(logger *zap.Logger) fxevent.Logger {
-//	  return &fxevent.ZapLogger{Logger: logger}
-//	})
+//   WithLogger(func(logger *zap.Logger) fxevent.Logger {
+//     return &fxevent.ZapLogger{Logger: logger}
+//   })
+//
 func WithLogger(constructor interface{}) Option {
 	return withLoggerOption{
 		constructor: constructor,
@@ -210,8 +287,8 @@ type withLoggerOption struct {
 	Stack       fxreflect.Stack
 }
 
-func (l withLoggerOption) apply(m *module) {
-	m.logConstructor = &provide{
+func (l withLoggerOption) apply(app *App) {
+	app.logConstructor = &provide{
 		Target: l.constructor,
 		Stack:  l.Stack,
 	}
@@ -238,14 +315,9 @@ func Logger(p Printer) Option {
 
 type loggerOption struct{ p Printer }
 
-func (l loggerOption) apply(m *module) {
-	if m.parent != nil {
-		m.app.err = fmt.Errorf("fx.Logger Option should be passed to top-level App, " +
-			"not to fx.Module")
-	} else {
-		np := writerFromPrinter(l.p)
-		m.log = fxlog.DefaultLogger(np) // assuming np is thread-safe.
-	}
+func (l loggerOption) apply(app *App) {
+	np := writerFromPrinter(l.p)
+	app.log = fxlog.DefaultLogger(np) // assuming np is thread-safe.
 }
 
 func (l loggerOption) String() string {
@@ -292,24 +364,23 @@ var NopLogger = WithLogger(func() fxevent.Logger { return fxevent.NopLogger })
 // configurable deadline (again, 15 seconds by default).
 type App struct {
 	err       error
-	clock     fxclock.Clock
-	lifecycle *lifecycleWrapper
-
 	container *dig.Container
-	root      *module
-	modules   []*module
-
+	lifecycle *lifecycleWrapper
+	// Constructors and its dependencies.
+	provides []provide
+	invokes  []invoke
+	// Used to setup logging within fx.
+	log            fxevent.Logger
+	logConstructor *provide // set only if fx.WithLogger was used
 	// Timeouts used
 	startTimeout time.Duration
 	stopTimeout  time.Duration
 	// Decides how we react to errors when building the graph.
 	errorHooks []ErrorHandler
 	validate   bool
-	// Whether to recover from panics in Dig container
-	recoverFromPanics bool
-
 	// Used to signal shutdowns.
-	receivers signalReceivers
+	donesMu sync.RWMutex
+	dones   []chan os.Signal
 
 	osExit func(code int) // os.Exit override; used for testing only
 }
@@ -325,9 +396,6 @@ type provide struct {
 	// IsSupply is true when the Target constructor was emitted by fx.Supply.
 	IsSupply   bool
 	SupplyType reflect.Type // set only if IsSupply
-
-	// Set if the type should be provided at private scope.
-	Private bool
 }
 
 // invoke is a single invocation request to Fx.
@@ -353,8 +421,8 @@ func ErrorHook(funcs ...ErrorHandler) Option {
 
 type errorHookOption []ErrorHandler
 
-func (eho errorHookOption) apply(m *module) {
-	m.app.errorHooks = append(m.app.errorHooks, eho...)
+func (eho errorHookOption) apply(app *App) {
+	app.errorHooks = append(app.errorHooks, eho...)
 }
 
 func (eho errorHookOption) String() string {
@@ -384,13 +452,8 @@ type validateOption struct {
 	validate bool
 }
 
-func (o validateOption) apply(m *module) {
-	if m.parent != nil {
-		m.app.err = fmt.Errorf("fx.validate Option should be passed to top-level App, " +
-			"not to fx.Module")
-	} else {
-		m.app.validate = o.validate
-	}
+func (o validateOption) apply(app *App) {
+	app.validate = o.validate
 }
 
 func (o validateOption) String() string {
@@ -406,6 +469,31 @@ func ValidateApp(opts ...Option) error {
 	return app.Err()
 }
 
+// Builds and connects the custom logger, returning an error if it failed.
+func (app *App) constructCustomLogger(buffer *logBuffer) (err error) {
+	p := app.logConstructor
+	fname := fxreflect.FuncName(p.Target)
+	defer func() {
+		app.log.LogEvent(&fxevent.LoggerInitialized{
+			Err:             err,
+			ConstructorName: fname,
+		})
+	}()
+
+	if err := app.container.Provide(p.Target); err != nil {
+		return fmt.Errorf("fx.WithLogger(%v) from:\n%+vFailed: %v",
+			fname, p.Stack, err)
+	}
+
+	// TODO: Use dig.FillProvideInfo to inspect the provided constructor
+	// and fail the application if its signature didn't match.
+
+	return app.container.Invoke(func(log fxevent.Logger) {
+		app.log = log
+		buffer.Connect(log)
+	})
+}
+
 // New creates and initializes an App, immediately executing any functions
 // registered via Invoke options. See the documentation of the App struct for
 // details on the application's initialization, startup, and shutdown logic.
@@ -413,13 +501,6 @@ func New(opts ...Option) *App {
 	logger := fxlog.DefaultLogger(os.Stderr)
 
 	app := &App{
-		clock:        fxclock.System,
-		startTimeout: DefaultTimeout,
-		stopTimeout:  DefaultTimeout,
-		receivers:    newSignalReceivers(),
-	}
-	app.root = &module{
-		app: app,
 		// We start with a logger that writes to stderr. One of the
 		// following three things can change this:
 		//
@@ -432,12 +513,13 @@ func New(opts ...Option) *App {
 		// user gave us. For the last case, however, we need to fall
 		// back to what was provided to fx.Logger if fx.WithLogger
 		// fails.
-		log: logger,
+		log:          logger,
+		startTimeout: DefaultTimeout,
+		stopTimeout:  DefaultTimeout,
 	}
-	app.modules = append(app.modules, app.root)
 
 	for _, opt := range opts {
-		opt.apply(app.root)
+		opt.apply(app)
 	}
 
 	// There are a few levels of wrapping on the lifecycle here. To quickly
@@ -450,47 +532,59 @@ func New(opts ...Option) *App {
 	// - appLogger ensures that the lifecycle always logs events to the
 	//   "current" logger associated with the fx.App.
 	app.lifecycle = &lifecycleWrapper{
-		lifecycle.New(appLogger{app}, app.clock),
+		lifecycle.New(appLogger{app}),
 	}
 
-	containerOptions := []dig.Option{
+	var (
+		bufferLogger *logBuffer // nil if WithLogger was not used
+
+		// Logger we fall back to if the custom logger fails to build.
+		// This will be a DefaultLogger that writes to stderr if the
+		// user didn't use fx.Logger, and a DefaultLogger that writes
+		// to their output stream if they did.
+		fallbackLogger fxevent.Logger
+	)
+	if app.logConstructor != nil {
+		// Since user supplied a custom logger, use a buffered logger
+		// to hold all messages until user supplied logger is
+		// instantiated. Then we flush those messages after fully
+		// constructing the custom logger.
+		bufferLogger = new(logBuffer)
+		fallbackLogger, app.log = app.log, bufferLogger
+	}
+
+	app.container = dig.New(
 		dig.DeferAcyclicVerification(),
 		dig.DryRun(app.validate),
-	}
+	)
 
-	if app.recoverFromPanics {
-		containerOptions = append(containerOptions, dig.RecoverFromPanics())
-	}
-
-	app.container = dig.New(containerOptions...)
-
-	for _, m := range app.modules {
-		m.build(app, app.container)
-	}
-
-	for _, m := range app.modules {
-		m.provideAll()
+	for _, p := range app.provides {
+		app.provide(p)
 	}
 
 	frames := fxreflect.CallerStack(0, 0) // include New in the stack for default Provides
-	app.root.provide(provide{
+	app.provide(provide{
 		Target: func() Lifecycle { return app.lifecycle },
 		Stack:  frames,
 	})
-	app.root.provide(provide{Target: app.shutdowner, Stack: frames})
-	app.root.provide(provide{Target: app.dotGraph, Stack: frames})
-
-	// Run decorators before executing any Invokes -- including the one
-	// inside constructCustomLogger.
-	app.err = multierr.Append(app.err, app.root.decorateAll())
+	app.provide(provide{Target: app.shutdowner, Stack: frames})
+	app.provide(provide{Target: app.dotGraph, Stack: frames})
 
 	// If you are thinking about returning here after provides: do not (just yet)!
 	// If a custom logger was being used, we're still buffering messages.
 	// We'll want to flush them to the logger.
 
-	// custom app logger will be initialized by the root module.
-	for _, m := range app.modules {
-		m.constructAllCustomLoggers()
+	// If WithLogger and Printer are both provided, WithLogger takes
+	// precedence.
+	if app.logConstructor != nil {
+		// If we failed to build the provided logger, flush the buffer
+		// to the fallback logger instead.
+		if err := app.constructCustomLogger(bufferLogger); err != nil {
+			app.err = multierr.Append(app.err, err)
+			app.log = fallbackLogger
+			bufferLogger.Connect(fallbackLogger)
+			return app
+		}
 	}
 
 	// This error might have come from the provide loop above. We've
@@ -499,7 +593,7 @@ func New(opts ...Option) *App {
 		return app
 	}
 
-	if err := app.root.executeInvokes(); err != nil {
+	if err := app.executeInvokes(); err != nil {
 		app.err = err
 
 		if dig.CanVisualizeError(err) {
@@ -514,10 +608,6 @@ func New(opts ...Option) *App {
 	}
 
 	return app
-}
-
-func (app *App) log() fxevent.Logger {
-	return app.root.log
 }
 
 // DotGraph contains a DOT language visualization of the dependency graph in
@@ -574,31 +664,30 @@ func (app *App) Run() {
 	// Historically, we do not os.Exit(0) even though most applications
 	// cede control to Fx with they call app.Run. To avoid a breaking
 	// change, never os.Exit for success.
-	if code := app.run(app.Wait); code != 0 {
+	if code := app.run(app.Done()); code != 0 {
 		app.exit(code)
 	}
 }
 
-func (app *App) run(done func() <-chan ShutdownSignal) (exitCode int) {
-	startCtx, cancel := app.clock.WithTimeout(context.Background(), app.StartTimeout())
+func (app *App) run(done <-chan os.Signal) (exitCode int) {
+	startCtx, cancel := context.WithTimeout(context.Background(), app.StartTimeout())
 	defer cancel()
 
 	if err := app.Start(startCtx); err != nil {
 		return 1
 	}
 
-	sig := <-done()
-	app.log().LogEvent(&fxevent.Stopping{Signal: sig.Signal})
-	exitCode = sig.ExitCode
+	sig := <-done
+	app.log.LogEvent(&fxevent.Stopping{Signal: sig})
 
-	stopCtx, cancel := app.clock.WithTimeout(context.Background(), app.StopTimeout())
+	stopCtx, cancel := context.WithTimeout(context.Background(), app.StopTimeout())
 	defer cancel()
 
 	if err := app.Stop(stopCtx); err != nil {
 		return 1
 	}
 
-	return exitCode
+	return 0
 }
 
 // Err returns any error encountered during New's initialization. See the
@@ -636,7 +725,7 @@ var (
 // encountered any errors in application initialization.
 func (app *App) Start(ctx context.Context) (err error) {
 	defer func() {
-		app.log().LogEvent(&fxevent.Started{Err: err})
+		app.log.LogEvent(&fxevent.Started{Err: err})
 	}()
 
 	if app.err != nil {
@@ -648,21 +737,17 @@ func (app *App) Start(ctx context.Context) (err error) {
 		hook:      _onStartHook,
 		callback:  app.start,
 		lifecycle: app.lifecycle,
-		log:       app.log(),
+		log:       app.log,
 	})
 }
 
-// withRollback will execute an anonymous function with a given context.
-// if the anon func returns an error, rollback methods will be called and related events emitted
-func (app *App) withRollback(
-	ctx context.Context,
-	f func(context.Context) error,
-) error {
-	if err := f(ctx); err != nil {
-		app.log().LogEvent(&fxevent.RollingBack{StartErr: err})
+func (app *App) start(ctx context.Context) error {
+	if err := app.lifecycle.Start(ctx); err != nil {
+		// Start failed, rolling back.
+		app.log.LogEvent(&fxevent.RollingBack{StartErr: err})
 
 		stopErr := app.lifecycle.Stop(ctx)
-		app.log().LogEvent(&fxevent.RolledBack{Err: stopErr})
+		app.log.LogEvent(&fxevent.RolledBack{Err: stopErr})
 
 		if stopErr != nil {
 			return multierr.Append(err, stopErr)
@@ -670,18 +755,7 @@ func (app *App) withRollback(
 
 		return err
 	}
-
 	return nil
-}
-
-func (app *App) start(ctx context.Context) error {
-	return app.withRollback(ctx, func(ctx context.Context) error {
-		if err := app.lifecycle.Start(ctx); err != nil {
-			return err
-		}
-		app.receivers.Start(ctx)
-		return nil
-	})
 }
 
 // Stop gracefully stops the application. It executes any registered OnStop
@@ -693,19 +767,14 @@ func (app *App) start(ctx context.Context) error {
 // fail.
 func (app *App) Stop(ctx context.Context) (err error) {
 	defer func() {
-		app.log().LogEvent(&fxevent.Stopped{Err: err})
+		app.log.LogEvent(&fxevent.Stopped{Err: err})
 	}()
-
-	cb := func(ctx context.Context) error {
-		defer app.receivers.Stop(ctx)
-		return app.lifecycle.Stop(ctx)
-	}
 
 	return withTimeout(ctx, &withTimeoutParams{
 		hook:      _onStopHook,
-		callback:  cb,
+		callback:  app.lifecycle.Stop,
 		lifecycle: app.lifecycle,
-		log:       app.log(),
+		log:       app.log,
 	})
 }
 
@@ -716,23 +785,14 @@ func (app *App) Stop(ctx context.Context) (err error) {
 //
 // Alternatively, a signal can be broadcast to all done channels manually by
 // using the Shutdown functionality (see the Shutdowner documentation for details).
-//
-// Note: The channel Done returns will not receive a signal unless the application
-// as been started via Start or Run.
 func (app *App) Done() <-chan os.Signal {
-	return app.receivers.Done()
-}
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, _sigINT, _sigTERM)
 
-// Wait returns a channel of [ShutdownSignal] to block on after starting the
-// application and function, similar to [App.Done], but with a minor difference.
-// Should an ExitCode be provided as a [ShutdownOption] to
-// the Shutdowner Shutdown method, the exit code will be available as part
-// of the ShutdownSignal struct.
-//
-// Should the app receive a SIGTERM or SIGINT, the given
-// signal will be populated in the ShutdownSignal struct.
-func (app *App) Wait() <-chan ShutdownSignal {
-	return app.receivers.Wait()
+	app.donesMu.Lock()
+	app.dones = append(app.dones, c)
+	app.donesMu.Unlock()
+	return c
 }
 
 // StartTimeout returns the configured startup timeout. Apps default to using
@@ -755,6 +815,156 @@ func (app *App) dotGraph() (DotGraph, error) {
 	return DotGraph(b.String()), err
 }
 
+func (app *App) provide(p provide) {
+	if app.err != nil {
+		return
+	}
+
+	constructor := p.Target
+	if _, ok := constructor.(Option); ok {
+		app.err = fmt.Errorf("fx.Option should be passed to fx.New directly, "+
+			"not to fx.Provide: fx.Provide received %v from:\n%+v",
+			constructor, p.Stack)
+		return
+	}
+
+	var info dig.ProvideInfo
+	opts := []dig.ProvideOption{
+		dig.FillProvideInfo(&info),
+	}
+	defer func() {
+		var ev fxevent.Event
+
+		switch {
+		case p.IsSupply:
+			ev = &fxevent.Supplied{
+				TypeName: p.SupplyType.String(),
+				Err:      app.err,
+			}
+
+		default:
+			outputNames := make([]string, len(info.Outputs))
+			for i, o := range info.Outputs {
+				outputNames[i] = o.String()
+			}
+
+			ev = &fxevent.Provided{
+				ConstructorName: fxreflect.FuncName(constructor),
+				OutputTypeNames: outputNames,
+				Err:             app.err,
+			}
+		}
+
+		app.log.LogEvent(ev)
+	}()
+
+	switch constructor := constructor.(type) {
+	case annotationError:
+		// fx.Annotate failed. Turn it into an Fx error.
+		app.err = fmt.Errorf(
+			"encountered error while applying annotation using fx.Annotate to %s: %+v",
+			fxreflect.FuncName(constructor.target), constructor.err)
+		return
+
+	case annotated:
+		c, err := constructor.Build()
+		if err != nil {
+			app.err = fmt.Errorf("fx.Provide(%v) from:\n%+vFailed: %v", constructor, p.Stack, err)
+			return
+		}
+
+		if err := app.container.Provide(c, opts...); err != nil {
+			app.err = fmt.Errorf("fx.Provide(%v) from:\n%+vFailed: %v", constructor, p.Stack, err)
+		}
+
+	case Annotated:
+		ann := constructor
+		switch {
+		case len(ann.Group) > 0 && len(ann.Name) > 0:
+			app.err = fmt.Errorf(
+				"fx.Annotated may specify only one of Name or Group: received %v from:\n%+v",
+				ann, p.Stack)
+			return
+		case len(ann.Name) > 0:
+			opts = append(opts, dig.Name(ann.Name))
+		case len(ann.Group) > 0:
+			opts = append(opts, dig.Group(ann.Group))
+		}
+
+		if err := app.container.Provide(ann.Target, opts...); err != nil {
+			app.err = fmt.Errorf("fx.Provide(%v) from:\n%+vFailed: %v", ann, p.Stack, err)
+		}
+
+	default:
+		if reflect.TypeOf(constructor).Kind() == reflect.Func {
+			ft := reflect.ValueOf(constructor).Type()
+
+			for i := 0; i < ft.NumOut(); i++ {
+				t := ft.Out(i)
+
+				if t == reflect.TypeOf(Annotated{}) {
+					app.err = fmt.Errorf(
+						"fx.Annotated should be passed to fx.Provide directly, "+
+							"it should not be returned by the constructor: "+
+							"fx.Provide received %v from:\n%+v",
+						fxreflect.FuncName(constructor), p.Stack)
+					return
+				}
+			}
+		}
+
+		if err := app.container.Provide(constructor, opts...); err != nil {
+			app.err = fmt.Errorf("fx.Provide(%v) from:\n%+vFailed: %v", fxreflect.FuncName(constructor), p.Stack, err)
+		}
+	}
+
+}
+
+// Execute invokes in order supplied to New, returning the first error
+// encountered.
+func (app *App) executeInvokes() error {
+	// TODO: consider taking a context to limit the time spent running invocations.
+
+	for _, i := range app.invokes {
+		if err := app.executeInvoke(i); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (app *App) executeInvoke(i invoke) (err error) {
+	fn := i.Target
+	fnName := fxreflect.FuncName(fn)
+
+	app.log.LogEvent(&fxevent.Invoking{FunctionName: fnName})
+	defer func() {
+		app.log.LogEvent(&fxevent.Invoked{
+			FunctionName: fnName,
+			Err:          err,
+			Trace:        fmt.Sprintf("%+v", i.Stack), // format stack trace as multi-line
+		})
+	}()
+
+	switch fn := fn.(type) {
+	case Option:
+		return fmt.Errorf("fx.Option should be passed to fx.New directly, "+
+			"not to fx.Invoke: fx.Invoke received %v from:\n%+v",
+			fn, i.Stack)
+
+	case annotated:
+		c, err := fn.Build()
+		if err != nil {
+			return err
+		}
+
+		return app.container.Invoke(c)
+	default:
+		return app.container.Invoke(fn)
+	}
+}
+
 type withTimeoutParams struct {
 	log       fxevent.Logger
 	hook      string
@@ -762,26 +972,9 @@ type withTimeoutParams struct {
 	lifecycle *lifecycleWrapper
 }
 
-// errHookCallbackExited is returned when a hook callback does not finish executing
-var errHookCallbackExited = errors.New("goroutine exited without returning")
-
 func withTimeout(ctx context.Context, param *withTimeoutParams) error {
 	c := make(chan error, 1)
-	go func() {
-		// If runtime.Goexit() is called from within the callback
-		// then nothing is written to the chan.
-		// However the defer will still be called, so we can write to the chan,
-		// to avoid hanging until the timeout is reached.
-		callbackExited := false
-		defer func() {
-			if !callbackExited {
-				c <- errHookCallbackExited
-			}
-		}()
-
-		c <- param.callback(ctx)
-		callbackExited = true
-	}()
+	go func() { c <- param.callback(ctx) }()
 
 	var err error
 
@@ -796,8 +989,33 @@ func withTimeout(ctx context.Context, param *withTimeoutParams) error {
 			err = ctx.Err()
 		}
 	}
-
-	return err
+	if err != context.DeadlineExceeded {
+		return err
+	}
+	// On timeout, report running hook's caller and recorded
+	// runtimes of hooks successfully run till end.
+	var r lifecycle.HookRecords
+	if param.hook == _onStartHook {
+		r = param.lifecycle.startHookRecords()
+	} else {
+		r = param.lifecycle.stopHookRecords()
+	}
+	caller := param.lifecycle.runningHookCaller()
+	// TODO: Once this is integrated into fxevent, we can
+	// leave error unchanged and send this to fxevent.Logger, whose
+	// implementation can then determine how the error is presented.
+	if len(r) > 0 {
+		sort.Sort(r)
+		return fmt.Errorf("%v hook added by %v failed: %w\n%+v",
+			param.hook,
+			caller,
+			err,
+			r)
+	}
+	return fmt.Errorf("%v hook added by %v failed: %w",
+		param.hook,
+		caller,
+		err)
 }
 
 // appLogger logs events to the given Fx app's "current" logger.
@@ -807,5 +1025,5 @@ func withTimeout(ctx context.Context, param *withTimeoutParams) error {
 type appLogger struct{ app *App }
 
 func (l appLogger) LogEvent(ev fxevent.Event) {
-	l.app.log().LogEvent(ev)
+	l.app.log.LogEvent(ev)
 }

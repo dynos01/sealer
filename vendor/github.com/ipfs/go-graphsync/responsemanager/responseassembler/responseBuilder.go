@@ -1,29 +1,27 @@
 package responseassembler
 
 import (
-	"context"
-
 	blocks "github.com/ipfs/go-block-format"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/ipld/go-ipld-prime"
-	"github.com/ipld/go-ipld-prime/codec/dagcbor"
 	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
 
 	"github.com/ipfs/go-graphsync"
-	"github.com/ipfs/go-graphsync/messagequeue"
+	gsmsg "github.com/ipfs/go-graphsync/message"
+	"github.com/ipfs/go-graphsync/notifications"
 )
 
 var log = logging.Logger("graphsync")
 
 type responseOperation interface {
-	build(builder *messagequeue.Builder)
+	build(builder *gsmsg.Builder)
 	size() uint64
 }
 
 type responseBuilder struct {
-	ctx         context.Context
 	requestID   graphsync.RequestID
 	operations  []responseOperation
+	notifees    []notifications.Notifee
 	linkTracker *peerLinkTracker
 }
 
@@ -51,16 +49,12 @@ func (rb *responseBuilder) PauseRequest() {
 	rb.operations = append(rb.operations, statusOperation{rb.requestID, graphsync.RequestPaused})
 }
 
-// SendUpdates sets up a PartialResponse with just the extension data provided
-func (rb *responseBuilder) SendUpdates(extensions []graphsync.ExtensionData) {
-	for _, extension := range extensions {
-		rb.SendExtensionData(extension)
-	}
-	rb.operations = append(rb.operations, statusOperation{rb.requestID, graphsync.PartialResponse})
+func (rb *responseBuilder) ClearRequest() {
+	_ = rb.linkTracker.FinishTracking(rb.requestID)
 }
 
-func (rb *responseBuilder) Context() context.Context {
-	return rb.ctx
+func (rb *responseBuilder) AddNotifee(notifee notifications.Notifee) {
+	rb.notifees = append(rb.notifees, notifee)
 }
 
 func (rb *responseBuilder) setupBlockOperation(
@@ -93,7 +87,7 @@ type statusOperation struct {
 	status    graphsync.ResponseStatusCode
 }
 
-func (fo statusOperation) build(builder *messagequeue.Builder) {
+func (fo statusOperation) build(builder *gsmsg.Builder) {
 	builder.AddResponseCode(fo.requestID, fo.status)
 }
 
@@ -106,18 +100,12 @@ type extensionOperation struct {
 	extension graphsync.ExtensionData
 }
 
-func (eo extensionOperation) build(builder *messagequeue.Builder) {
+func (eo extensionOperation) build(builder *gsmsg.Builder) {
 	builder.AddExtensionData(eo.requestID, eo.extension)
 }
 
 func (eo extensionOperation) size() uint64 {
-	if eo.extension.Data == nil {
-		return 0
-	}
-	// any erorr produced by this call will be picked up during actual encode, so
-	// we can defer handling till then and let it be zero for now
-	len, _ := dagcbor.EncodedLength(eo.extension.Data)
-	return uint64(len)
+	return uint64(len(eo.extension.Data))
 }
 
 type blockOperation struct {
@@ -128,7 +116,7 @@ type blockOperation struct {
 	index     int64
 }
 
-func (bo blockOperation) build(builder *messagequeue.Builder) {
+func (bo blockOperation) build(builder *gsmsg.Builder) {
 	if bo.sendBlock {
 		cidLink := bo.link.(cidlink.Link)
 		block, err := blocks.NewBlockWithCid(bo.data, cidLink.Cid)
@@ -137,12 +125,7 @@ func (bo blockOperation) build(builder *messagequeue.Builder) {
 		}
 		builder.AddBlock(block)
 	}
-	action := graphsync.LinkActionPresent
-	if bo.data == nil {
-		action = graphsync.LinkActionMissing
-	}
-	builder.AddLink(bo.requestID, bo.link, action)
-	builder.AddBlockData(bo.requestID, bo.Block())
+	builder.AddLink(bo.requestID, bo.link, bo.data != nil)
 }
 
 func (bo blockOperation) size() uint64 {

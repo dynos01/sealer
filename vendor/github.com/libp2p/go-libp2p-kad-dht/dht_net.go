@@ -4,7 +4,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p-core/network"
 
 	"github.com/libp2p/go-libp2p-kad-dht/internal/net"
 	"github.com/libp2p/go-libp2p-kad-dht/metrics"
@@ -109,6 +109,9 @@ func (dht *IpfsDHT) handleNewMessage(s network.Stream) bool {
 			}
 			return false
 		}
+
+		// a peer has queried us, let's add it to RT
+		dht.peerFound(dht.ctx, mPeer, true)
 
 		if c := baseLogger.Check(zap.DebugLevel, "handling message"); c != nil {
 			c.Write(zap.String("from", mPeer.String()),

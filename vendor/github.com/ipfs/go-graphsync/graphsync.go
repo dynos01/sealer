@@ -5,45 +5,18 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	"github.com/ipld/go-ipld-prime"
-	"github.com/ipld/go-ipld-prime/datamodel"
 	"github.com/ipld/go-ipld-prime/traversal"
-	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p-core/peer"
 )
 
 // RequestID is a unique identifier for a GraphSync request.
-type RequestID struct{ string }
+type RequestID int32
 
 // Tag returns an easy way to identify this request id as a graphsync request (for libp2p connections)
 func (r RequestID) Tag() string {
-	return r.String()
-}
-
-// String form of a RequestID (should be a well-formed UUIDv4 string)
-func (r RequestID) String() string {
-	return uuid.Must(uuid.FromBytes([]byte(r.string))).String()
-}
-
-// Byte form of a RequestID
-func (r RequestID) Bytes() []byte {
-	return []byte(r.string)
-}
-
-// Create a new, random RequestID (should be a UUIDv4)
-func NewRequestID() RequestID {
-	u := uuid.New()
-	return RequestID{string(u[:])}
-}
-
-// Create a RequestID from a byte slice
-func ParseRequestID(b []byte) (RequestID, error) {
-	_, err := uuid.FromBytes(b)
-	if err != nil {
-		return RequestID{}, err
-	}
-	return RequestID{string(b)}, nil
+	return fmt.Sprintf("graphsync-request-%d", r)
 }
 
 // Priority a priority for a GraphSync request.
@@ -55,12 +28,17 @@ type ExtensionName string
 // ExtensionData is a name/data pair for a graphsync extension
 type ExtensionData struct {
 	Name ExtensionName
-	Data datamodel.Node
+	Data []byte
 }
 
 const (
 
 	// Known Graphsync Extensions
+
+	// ExtensionMetadata provides response metadata for a Graphsync request and is
+	// documented at
+	// https://github.com/ipld/specs/blob/master/block-layer/graphsync/known_extensions.md
+	ExtensionMetadata = ExtensionName("graphsync/response-metadata")
 
 	// ExtensionDoNotSendCIDs tells the responding peer not to send certain blocks if they
 	// are encountered in a traversal and is documented at
@@ -127,29 +105,14 @@ func (e RequestNotFoundErr) Error() string {
 }
 
 // RemoteMissingBlockErr indicates that the remote peer was missing a block
-// in the selector requested, and we also don't have it locally.
-// It is a  -terminal error in the error stream
+// in the selector requested. It is a non-terminal error in the error stream
 // for a request and does NOT cause a request to fail completely
 type RemoteMissingBlockErr struct {
 	Link ipld.Link
-	Path ipld.Path
 }
 
 func (e RemoteMissingBlockErr) Error() string {
-	return fmt.Sprintf("remote peer is missing block (%s) at path %s", e.Link.String(), e.Path)
-}
-
-// RemoteIncorrectResponseError indicates that the remote peer sent a response
-// to a traversal that did not correspond with the expected next link
-// in the selector traversal based on verification of data up to this point
-type RemoteIncorrectResponseError struct {
-	LocalLink  ipld.Link
-	RemoteLink ipld.Link
-	Path       ipld.Path
-}
-
-func (e RemoteIncorrectResponseError) Error() string {
-	return fmt.Sprintf("expected link (%s) at path %s does not match link sent by remote (%s), possible malicious responder", e.LocalLink, e.Path, e.RemoteLink)
+	return fmt.Sprintf("remote peer is missing block: %s", e.Link.String())
 }
 
 var (
@@ -183,24 +146,11 @@ type RequestData interface {
 
 	// Extension returns the content for an extension on a response, or errors
 	// if extension is not present
-	Extension(name ExtensionName) (datamodel.Node, bool)
+	Extension(name ExtensionName) ([]byte, bool)
 
 	// IsCancel returns true if this particular request is being cancelled
-	Type() RequestType
+	IsCancel() bool
 }
-
-type RequestType string
-
-const (
-	// RequestTypeNew means a new request
-	RequestTypeNew = RequestType("New")
-
-	// RequestTypeCancel means cancel the request referenced by request ID
-	RequestTypeCancel = RequestType("Cancel")
-
-	// RequestTypeUpdate means the extensions contain an update about this request
-	RequestTypeUpdate = RequestType("Update")
-)
 
 // ResponseData describes a received Graphsync response
 type ResponseData interface {
@@ -212,51 +162,7 @@ type ResponseData interface {
 
 	// Extension returns the content for an extension on a response, or errors
 	// if extension is not present
-	Extension(name ExtensionName) (datamodel.Node, bool)
-
-	// Metadata returns a copy of the link metadata contained in this response
-	Metadata() LinkMetadata
-}
-
-// LinkAction is a code that is used by message metadata to communicate the
-// state and reason for blocks being included or not in a transfer
-type LinkAction string
-
-const (
-	// LinkActionPresent means the linked block was present on this machine, and
-	// is included a this message
-	LinkActionPresent = LinkAction("Present")
-
-	// LinkActionDuplicateNotSent means the linked block was present on this machine,
-	// but I am not sending it (most likely duplicate)
-	LinkActionDuplicateNotSent = LinkAction("DuplicateNotSent")
-
-	// LinkActionMissing means I did not have the linked block, so I skipped over
-	// this part of the traversal
-	LinkActionMissing = LinkAction("Missing")
-
-	// LinkActionDuplicateDAGSkipped means the DAG with this link points toward has already
-	// been traversed entirely in the course of this request so I am skipping over it
-	LinkActionDuplicateDAGSkipped = LinkAction("DuplicateDAGSkipped")
-)
-
-// DidFollowLink indicates whether the remote actually loaded the block and
-// followed it in its selector traversal
-func (l LinkAction) DidFollowLink() bool {
-	return l == LinkActionPresent || l == LinkActionDuplicateNotSent
-}
-
-// LinkMetadataIterator is used to access individual link metadata through a
-// LinkMetadata object
-type LinkMetadataIterator func(cid.Cid, LinkAction)
-
-// LinkMetadata is used to access link metadata through an Iterator
-type LinkMetadata interface {
-	// Length returns the number of metadata entries
-	Length() int64
-	// Iterate steps over individual metadata one by one using the provided
-	// callback
-	Iterate(LinkMetadataIterator)
+	Extension(name ExtensionName) ([]byte, bool)
 }
 
 // BlockData gives information about a block included in a graphsync response
@@ -277,14 +183,12 @@ type BlockData interface {
 // IncomingRequestHookActions are actions that a request hook can take to change
 // behavior for the response
 type IncomingRequestHookActions interface {
-	AugmentContext(func(reqCtx context.Context) context.Context)
 	SendExtensionData(ExtensionData)
 	UsePersistenceOption(name string)
 	UseLinkTargetNodePrototypeChooser(traversal.LinkTargetNodePrototypeChooser)
 	TerminateWithError(error)
 	ValidateRequest()
 	PauseResponse()
-	MaxLinks(uint64)
 }
 
 // OutgoingBlockHookActions are actions that an outgoing block hook can take to
@@ -300,7 +204,6 @@ type OutgoingBlockHookActions interface {
 type OutgoingRequestHookActions interface {
 	UsePersistenceOption(name string)
 	UseLinkTargetNodePrototypeChooser(traversal.LinkTargetNodePrototypeChooser)
-	MaxLinks(uint64)
 }
 
 // IncomingResponseHookActions are actions that incoming response hook can take
@@ -325,6 +228,10 @@ type RequestUpdatedHookActions interface {
 	SendExtensionData(ExtensionData)
 	UnpauseResponse()
 }
+
+// OnIncomingRequestQueuedHook is a hook that runs each time a new incoming request is added to the responder's task queue.
+// It receives the peer that sent the request and all data about the request.
+type OnIncomingRequestQueuedHook func(p peer.ID, request RequestData)
 
 // OnIncomingRequestHook is a hook that runs each time a new request is received.
 // It receives the peer that sent the request and all data about the request.
@@ -374,9 +281,9 @@ type OnReceiverNetworkErrorListener func(p peer.ID, err error)
 // OnResponseCompletedListener provides a way to listen for when responder has finished serving a response
 type OnResponseCompletedListener func(p peer.ID, request RequestData, status ResponseStatusCode)
 
-// OnRequestProcessingListener is called when a request actually begins processing (reaches
-// the top of the request queue)
-type OnRequestProcessingListener func(p peer.ID, request RequestData, inProgressRequestCount int)
+// OnOutgoingRequestProcessingListener is called when a request actually begins processing (reaches
+// the top of the outgoing request queue)
+type OnOutgoingRequestProcessingListener func(p peer.ID, request RequestData, inProgressRequestCount int)
 
 // OnRequestorCancelledListener provides a way to listen for responses the requestor canncels
 type OnRequestorCancelledListener func(p peer.ID, request RequestData)
@@ -425,43 +332,6 @@ type Stats struct {
 	OutgoingResponses ResponseStats
 }
 
-// RequestState describes the current general state of a request
-type RequestState uint64
-
-// RequestStates describe a set of request IDs and their current state
-type RequestStates map[RequestID]RequestState
-
-// RequestIDContextKey is used to the desired request id in context when
-// initializing a request
-type RequestIDContextKey struct{}
-
-const (
-	// Queued means a request has been received and is queued for processing
-	Queued RequestState = iota
-	// Running means a request is actively sending or receiving data
-	Running
-	// Paused means a request is paused
-	Paused
-	// CompletingSend means we have processed a query and are waiting for data to
-	// go over the network
-	CompletingSend
-)
-
-func (rs RequestState) String() string {
-	switch rs {
-	case Queued:
-		return "queued"
-	case Running:
-		return "running"
-	case Paused:
-		return "paused"
-	case CompletingSend:
-		return "completing send"
-	default:
-		return "unrecognized request state"
-	}
-}
-
 // GraphExchange is a protocol that can exchange IPLD graphs based on a selector
 type GraphExchange interface {
 	// Request initiates a new GraphSync request to the given peer using the given selector spec.
@@ -472,6 +342,9 @@ type GraphExchange interface {
 
 	// UnregisterPersistenceOption unregisters an alternate loader/storer combo
 	UnregisterPersistenceOption(name string) error
+
+	// RegisterIncomingRequestQueuedHook adds a hook that runs when a new incoming request is added to the responder's task queue.
+	RegisterIncomingRequestQueuedHook(hook OnIncomingRequestQueuedHook) UnregisterHookFunc
 
 	// RegisterIncomingRequestHook adds a hook that runs when a request is received
 	RegisterIncomingRequestHook(hook OnIncomingRequestHook) UnregisterHookFunc
@@ -491,13 +364,9 @@ type GraphExchange interface {
 	// RegisterRequestUpdatedHook adds a hook that runs every time an update to a request is received
 	RegisterRequestUpdatedHook(hook OnRequestUpdatedHook) UnregisterHookFunc
 
-	// RegisterOutgoingRequestProcessingListener adds a listener that gets called when an outgoing request actually begins processing (reaches
+	// RegisterOutgoingRequestProcessingListener adds a listener that gets called when a request actually begins processing (reaches
 	// the top of the outgoing request queue)
-	RegisterOutgoingRequestProcessingListener(listener OnRequestProcessingListener) UnregisterHookFunc
-
-	// RegisterOutgoingRequestProcessingListener adds a listener that gets called when an incoming request actually begins processing (reaches
-	// the top of the outgoing request queue)
-	RegisterIncomingRequestProcessingListener(listener OnRequestProcessingListener) UnregisterHookFunc
+	RegisterOutgoingRequestProcessingListener(listener OnOutgoingRequestProcessingListener) UnregisterHookFunc
 
 	// RegisterCompletedResponseListener adds a listener on the responder for completed responses
 	RegisterCompletedResponseListener(listener OnResponseCompletedListener) UnregisterHookFunc
@@ -515,18 +384,25 @@ type GraphExchange interface {
 	// RegisterReceiverNetworkErrorListener adds a listener for when errors occur receiving data over the wire
 	RegisterReceiverNetworkErrorListener(listener OnReceiverNetworkErrorListener) UnregisterHookFunc
 
-	// Pause pauses an in progress request or response (may take 1 or more blocks to process)
-	Pause(context.Context, RequestID) error
-
-	// Unpause unpauses a request or response that was paused
+	// UnpauseRequest unpauses a request that was paused in a block hook based request ID
 	// Can also send extensions with unpause
-	Unpause(context.Context, RequestID, ...ExtensionData) error
+	UnpauseRequest(RequestID, ...ExtensionData) error
 
-	// Cancel cancels an in progress request or response
-	Cancel(context.Context, RequestID) error
+	// PauseRequest pauses an in progress request (may take 1 or more blocks to process)
+	PauseRequest(RequestID) error
 
-	// SendUpdate sends an update for an in progress request or response
-	SendUpdate(context.Context, RequestID, ...ExtensionData) error
+	// UnpauseResponse unpauses a response that was paused in a block hook based on peer ID and request ID
+	// Can also send extensions with unpause
+	UnpauseResponse(peer.ID, RequestID, ...ExtensionData) error
+
+	// PauseResponse pauses an in progress response (may take 1 or more blocks to process)
+	PauseResponse(peer.ID, RequestID) error
+
+	// CancelResponse cancels an in progress response
+	CancelResponse(peer.ID, RequestID) error
+
+	// CancelRequest cancels an in progress request
+	CancelRequest(context.Context, RequestID) error
 
 	// Stats produces insight on the current state of a graphsync exchange
 	Stats() Stats

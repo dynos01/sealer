@@ -9,7 +9,6 @@ import (
 	bloom "github.com/ipfs/bbloom"
 	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
-	ipld "github.com/ipfs/go-ipld-format"
 	metrics "github.com/ipfs/go-metrics-interface"
 )
 
@@ -30,17 +29,14 @@ func bloomCached(ctx context.Context, bs Blockstore, bloomSize, hashCount int) (
 			"Total number of requests to bloom cache").Counter(),
 		buildChan: make(chan struct{}),
 	}
-	if v, ok := bs.(Viewer); ok {
-		bc.viewer = v
-	}
 	go func() {
 		err := bc.build(ctx)
 		if err != nil {
 			select {
 			case <-ctx.Done():
-				logger.Warning("Cache rebuild closed by context finishing: ", err)
+				log.Warning("Cache rebuild closed by context finishing: ", err)
 			default:
-				logger.Error(err)
+				log.Error(err)
 			}
 			return
 		}
@@ -71,15 +67,11 @@ type bloomcache struct {
 
 	buildChan  chan struct{}
 	blockstore Blockstore
-	viewer     Viewer
 
 	// Statistics
 	hits  metrics.Counter
 	total metrics.Counter
 }
-
-var _ Blockstore = (*bloomcache)(nil)
-var _ Viewer = (*bloomcache)(nil)
 
 func (b *bloomcache) BloomActive() bool {
 	return atomic.LoadInt32(&b.active) != 0
@@ -95,7 +87,7 @@ func (b *bloomcache) Wait(ctx context.Context) error {
 }
 
 func (b *bloomcache) build(ctx context.Context) error {
-	evt := logger.EventBegin(ctx, "bloomcache.build")
+	evt := log.EventBegin(ctx, "bloomcache.build")
 	defer evt.Done()
 	defer close(b.buildChan)
 
@@ -111,7 +103,7 @@ func (b *bloomcache) build(ctx context.Context) error {
 				atomic.StoreInt32(&b.active, 1)
 				return nil
 			}
-			b.bloom.AddTS(key.Hash()) // Use binary key, the more compact the better
+			b.bloom.AddTS(key.Bytes()) // Use binary key, the more compact the better
 		case <-ctx.Done():
 			b.buildErr = ctx.Err()
 			return b.buildErr
@@ -132,13 +124,13 @@ func (b *bloomcache) DeleteBlock(ctx context.Context, k cid.Cid) error {
 func (b *bloomcache) hasCached(k cid.Cid) (has bool, ok bool) {
 	b.total.Inc()
 	if !k.Defined() {
-		logger.Error("undefined in bloom cache")
+		log.Error("undefined in bloom cache")
 		// Return cache invalid so call to blockstore
 		// in case of invalid key is forwarded deeper
 		return false, false
 	}
 	if b.BloomActive() {
-		blr := b.bloom.HasTS(k.Hash())
+		blr := b.bloom.HasTS(k.Bytes())
 		if !blr { // not contained in bloom is only conclusive answer bloom gives
 			b.hits.Inc()
 			return false, true
@@ -157,30 +149,15 @@ func (b *bloomcache) Has(ctx context.Context, k cid.Cid) (bool, error) {
 
 func (b *bloomcache) GetSize(ctx context.Context, k cid.Cid) (int, error) {
 	if has, ok := b.hasCached(k); ok && !has {
-		return -1, ipld.ErrNotFound{Cid: k}
+		return -1, ErrNotFound
 	}
 
 	return b.blockstore.GetSize(ctx, k)
 }
 
-func (b *bloomcache) View(ctx context.Context, k cid.Cid, callback func([]byte) error) error {
-	if b.viewer == nil {
-		blk, err := b.Get(ctx, k)
-		if err != nil {
-			return err
-		}
-		return callback(blk.RawData())
-	}
-
-	if has, ok := b.hasCached(k); ok && !has {
-		return ipld.ErrNotFound{Cid: k}
-	}
-	return b.viewer.View(ctx, k, callback)
-}
-
 func (b *bloomcache) Get(ctx context.Context, k cid.Cid) (blocks.Block, error) {
 	if has, ok := b.hasCached(k); ok && !has {
-		return nil, ipld.ErrNotFound{Cid: k}
+		return nil, ErrNotFound
 	}
 
 	return b.blockstore.Get(ctx, k)
@@ -190,7 +167,7 @@ func (b *bloomcache) Put(ctx context.Context, bl blocks.Block) error {
 	// See comment in PutMany
 	err := b.blockstore.Put(ctx, bl)
 	if err == nil {
-		b.bloom.AddTS(bl.Cid().Hash())
+		b.bloom.AddTS(bl.Cid().Bytes())
 	}
 	return err
 }
@@ -205,7 +182,7 @@ func (b *bloomcache) PutMany(ctx context.Context, bs []blocks.Block) error {
 		return err
 	}
 	for _, bl := range bs {
-		b.bloom.AddTS(bl.Cid().Hash())
+		b.bloom.AddTS(bl.Cid().Bytes())
 	}
 	return nil
 }

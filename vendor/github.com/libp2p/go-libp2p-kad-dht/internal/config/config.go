@@ -4,16 +4,15 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ipfs/boxo/ipns"
 	ds "github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
+	"github.com/ipfs/go-ipns"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/protocol"
 	"github.com/libp2p/go-libp2p-kad-dht/providers"
 	"github.com/libp2p/go-libp2p-kbucket/peerdiversity"
 	record "github.com/libp2p/go-libp2p-record"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/protocol"
-	ma "github.com/multiformats/go-multiaddr"
 )
 
 // DefaultPrefix is the application specific prefix attached to all DHT protocols by default.
@@ -33,21 +32,20 @@ type RouteTableFilterFunc func(dht interface{}, p peer.ID) bool
 
 // Config is a structure containing all the options that can be used when constructing a DHT.
 type Config struct {
-	Datastore              ds.Batching
-	Validator              record.Validator
-	ValidatorChanged       bool // if true implies that the validator has been changed and that Defaults should not be used
-	Mode                   ModeOpt
-	ProtocolPrefix         protocol.ID
-	V1ProtocolOverride     protocol.ID
-	BucketSize             int
-	Concurrency            int
-	Resiliency             int
-	MaxRecordAge           time.Duration
-	EnableProviders        bool
-	EnableValues           bool
-	ProviderStore          providers.ProviderStore
-	QueryPeerFilter        QueryFilterFunc
-	LookupCheckConcurrency int
+	Datastore          ds.Batching
+	Validator          record.Validator
+	ValidatorChanged   bool // if true implies that the validator has been changed and that Defaults should not be used
+	Mode               ModeOpt
+	ProtocolPrefix     protocol.ID
+	V1ProtocolOverride protocol.ID
+	BucketSize         int
+	Concurrency        int
+	Resiliency         int
+	MaxRecordAge       time.Duration
+	EnableProviders    bool
+	EnableValues       bool
+	ProviderStore      providers.ProviderStore
+	QueryPeerFilter    QueryFilterFunc
 
 	RoutingTable struct {
 		RefreshQueryTimeout time.Duration
@@ -60,14 +58,10 @@ type Config struct {
 	}
 
 	BootstrapPeers func() []peer.AddrInfo
-	AddressFilter  func([]ma.Multiaddr) []ma.Multiaddr
 
 	// test specific Config options
 	DisableFixLowPeers          bool
 	TestAddressUpdateProcessing bool
-
-	EnableOptimisticProvide       bool
-	OptimisticProvideJobsPoolSize int
 }
 
 func EmptyQueryFilter(_ interface{}, ai peer.AddrInfo) bool { return true }
@@ -115,21 +109,16 @@ var Defaults = func(o *Config) error {
 	o.EnableValues = true
 	o.QueryPeerFilter = EmptyQueryFilter
 
-	o.RoutingTable.LatencyTolerance = 10 * time.Second
-	o.RoutingTable.RefreshQueryTimeout = 10 * time.Second
+	o.RoutingTable.LatencyTolerance = time.Minute
+	o.RoutingTable.RefreshQueryTimeout = 1 * time.Minute
 	o.RoutingTable.RefreshInterval = 10 * time.Minute
 	o.RoutingTable.AutoRefresh = true
 	o.RoutingTable.PeerFilter = EmptyRTFilter
-
-	o.MaxRecordAge = providers.ProvideValidity
+	o.MaxRecordAge = time.Hour * 36
 
 	o.BucketSize = defaultBucketSize
 	o.Concurrency = 10
 	o.Resiliency = 3
-	o.LookupCheckConcurrency = 256
-
-	// MAGIC: It makes sense to set it to a multiple of OptProvReturnRatio * BucketSize. We chose a multiple of 4.
-	o.OptimisticProvideJobsPoolSize = 60
 
 	return nil
 }

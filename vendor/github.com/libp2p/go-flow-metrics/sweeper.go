@@ -5,8 +5,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/benbjohnson/clock"
 )
 
 // IdleRate the rate at which we declare a meter idle (and stop tracking it
@@ -21,14 +19,6 @@ var alpha = 1 - math.Exp(-1.0)
 
 // The global sweeper.
 var globalSweeper sweeper
-
-var cl = clock.New()
-
-// SetClock sets a clock to use in the sweeper.
-// This will probably only ever be useful for testing purposes.
-func SetClock(c clock.Clock) {
-	cl = c
-}
 
 type sweeper struct {
 	sweepOnce sync.Once
@@ -63,10 +53,10 @@ func (sw *sweeper) register(m *Meter) {
 }
 
 func (sw *sweeper) runActive() {
-	ticker := cl.Ticker(time.Second)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
-	sw.lastUpdateTime = cl.Now()
+	sw.lastUpdateTime = time.Now()
 	for len(sw.meters) > 0 {
 		// Scale back allocation.
 		if len(sw.meters)*2 < cap(sw.meters) {
@@ -90,7 +80,7 @@ func (sw *sweeper) update() {
 	sw.snapshotMu.Lock()
 	defer sw.snapshotMu.Unlock()
 
-	now := cl.Now()
+	now := time.Now()
 	tdiff := now.Sub(sw.lastUpdateTime)
 	if tdiff <= 0 {
 		return

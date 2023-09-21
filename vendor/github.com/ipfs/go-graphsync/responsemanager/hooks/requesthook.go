@@ -1,13 +1,12 @@
 package hooks
 
 import (
-	"context"
 	"errors"
 
 	"github.com/hannahhoward/go-pubsub"
 	"github.com/ipld/go-ipld-prime"
 	"github.com/ipld/go-ipld-prime/traversal"
-	peer "github.com/libp2p/go-libp2p/core/peer"
+	peer "github.com/libp2p/go-libp2p-core/peer"
 
 	"github.com/ipfs/go-graphsync"
 )
@@ -15,6 +14,40 @@ import (
 // PersistenceOptions is an interface for getting loaders by name
 type PersistenceOptions interface {
 	GetLinkSystem(name string) (ipld.LinkSystem, bool)
+}
+
+// IncomingRequestQueuedHooks is a set of incoming request queued hooks that can be processed.
+type IncomingRequestQueuedHooks struct {
+	pubSub *pubsub.PubSub
+}
+
+type internalRequestQueuedHookEvent struct {
+	p       peer.ID
+	request graphsync.RequestData
+}
+
+func requestQueuedHookDispatcher(event pubsub.Event, subscriberFn pubsub.SubscriberFn) error {
+	ie := event.(internalRequestQueuedHookEvent)
+	hook := subscriberFn.(graphsync.OnIncomingRequestQueuedHook)
+	hook(ie.p, ie.request)
+	return nil
+}
+
+// Register registers an extension to process new incoming requests.
+func (rqh *IncomingRequestQueuedHooks) Register(hook graphsync.OnIncomingRequestQueuedHook) graphsync.UnregisterHookFunc {
+	return graphsync.UnregisterHookFunc(rqh.pubSub.Subscribe(hook))
+}
+
+// NewRequestQueuedHooks returns a new list of incoming request queued hooks.
+func NewRequestQueuedHooks() *IncomingRequestQueuedHooks {
+	return &IncomingRequestQueuedHooks{
+		pubSub: pubsub.New(requestQueuedHookDispatcher),
+	}
+}
+
+// ProcessRequestQueuedHooks runs request hooks against an incoming queued request.
+func (rqh *IncomingRequestQueuedHooks) ProcessRequestQueuedHooks(p peer.ID, request graphsync.RequestData) {
+	_ = rqh.pubSub.Publish(internalRequestQueuedHookEvent{p, request})
 }
 
 // IncomingRequestHooks is a set of incoming request hooks that can be processed
@@ -57,15 +90,12 @@ type RequestResult struct {
 	CustomChooser    traversal.LinkTargetNodePrototypeChooser
 	Err              error
 	Extensions       []graphsync.ExtensionData
-	Ctx              context.Context
-	MaxLinks         uint64
 }
 
 // ProcessRequestHooks runs request hooks against an incoming request
-func (irh *IncomingRequestHooks) ProcessRequestHooks(p peer.ID, request graphsync.RequestData, reqCtx context.Context) RequestResult {
+func (irh *IncomingRequestHooks) ProcessRequestHooks(p peer.ID, request graphsync.RequestData) RequestResult {
 	ha := &requestHookActions{
 		persistenceOptions: irh.persistenceOptions,
-		ctx:                reqCtx,
 	}
 	_ = irh.pubSub.Publish(internalRequestHookEvent{p, request, ha})
 	return ha.result()
@@ -79,8 +109,6 @@ type requestHookActions struct {
 	linkSystem         ipld.LinkSystem
 	chooser            traversal.LinkTargetNodePrototypeChooser
 	extensions         []graphsync.ExtensionData
-	ctx                context.Context
-	maxLinks           uint64
 }
 
 func (ha *requestHookActions) result() RequestResult {
@@ -91,8 +119,6 @@ func (ha *requestHookActions) result() RequestResult {
 		CustomChooser:    ha.chooser,
 		Err:              ha.err,
 		Extensions:       ha.extensions,
-		Ctx:              ha.ctx,
-		MaxLinks:         ha.maxLinks,
 	}
 }
 
@@ -117,18 +143,10 @@ func (ha *requestHookActions) UsePersistenceOption(name string) {
 	ha.linkSystem = linkSystem
 }
 
-func (ha *requestHookActions) MaxLinks(maxLinks uint64) {
-	ha.maxLinks = maxLinks
-}
-
 func (ha *requestHookActions) UseLinkTargetNodePrototypeChooser(chooser traversal.LinkTargetNodePrototypeChooser) {
 	ha.chooser = chooser
 }
 
 func (ha *requestHookActions) PauseResponse() {
 	ha.isPaused = true
-}
-
-func (ha *requestHookActions) AugmentContext(augment func(reqCtx context.Context) context.Context) {
-	ha.ctx = augment(ha.ctx)
 }

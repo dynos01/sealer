@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p-core/peer"
 )
 
 // PeerProcess is any process that provides services for a peer
@@ -16,7 +16,7 @@ type PeerProcess interface {
 type PeerHandler interface{}
 
 // PeerProcessFactory provides a function that will create a PeerQueue.
-type PeerProcessFactory func(ctx context.Context, p peer.ID, onShutdown func(peer.ID)) PeerHandler
+type PeerProcessFactory func(ctx context.Context, p peer.ID) PeerHandler
 
 type peerProcessInstance struct {
 	refcnt  int
@@ -105,7 +105,7 @@ func (pm *PeerManager) GetProcess(
 func (pm *PeerManager) getOrCreate(p peer.ID) *peerProcessInstance {
 	pqi, ok := pm.peerProcesses[p]
 	if !ok {
-		pq := pm.createPeerProcess(pm.ctx, p, pm.onQueueShutdown)
+		pq := pm.createPeerProcess(pm.ctx, p)
 		if pprocess, ok := pq.(PeerProcess); ok {
 			pprocess.Startup()
 		}
@@ -113,10 +113,4 @@ func (pm *PeerManager) getOrCreate(p peer.ID) *peerProcessInstance {
 		pm.peerProcesses[p] = pqi
 	}
 	return pqi
-}
-
-func (pm *PeerManager) onQueueShutdown(p peer.ID) {
-	pm.peerProcessesLk.Lock()
-	defer pm.peerProcessesLk.Unlock()
-	delete(pm.peerProcesses, p)
 }

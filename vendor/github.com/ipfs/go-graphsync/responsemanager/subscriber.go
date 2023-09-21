@@ -1,7 +1,7 @@
 package responsemanager
 
 import (
-	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p-core/peer"
 
 	"github.com/ipfs/go-graphsync"
 	gsmsg "github.com/ipfs/go-graphsync/message"
@@ -12,8 +12,7 @@ import (
 
 // RequestCloser can cancel request on a network error
 type RequestCloser interface {
-	TerminateRequest(requestID graphsync.RequestID)
-	CloseWithNetworkError(requestID graphsync.RequestID)
+	CloseWithNetworkError(p peer.ID, requestID graphsync.RequestID)
 }
 
 type subscriber struct {
@@ -26,32 +25,35 @@ type subscriber struct {
 	connManager           network.ConnManager
 }
 
-func (s *subscriber) OnNext(_ notifications.Topic, event notifications.Event) {
+func (s *subscriber) OnNext(topic notifications.Topic, event notifications.Event) {
 	responseEvent, ok := event.(messagequeue.Event)
 	if !ok {
 		return
 	}
-	switch responseEvent.Name {
-	case messagequeue.Error:
-		s.requestCloser.CloseWithNetworkError(s.request.ID())
-		responseCode := responseEvent.Metadata.ResponseCodes[s.request.ID()]
-		if responseCode.IsTerminal() {
-			s.requestCloser.TerminateRequest(s.request.ID())
-		}
-		s.networkErrorListeners.NotifyNetworkErrorListeners(s.p, s.request, responseEvent.Err)
-	case messagequeue.Sent:
-		blockDatas := responseEvent.Metadata.BlockData[s.request.ID()]
-		for _, blockData := range blockDatas {
+	blockData, isBlockData := topic.(graphsync.BlockData)
+	if isBlockData {
+		switch responseEvent.Name {
+		case messagequeue.Error:
+			s.networkErrorListeners.NotifyNetworkErrorListeners(s.p, s.request, responseEvent.Err)
+			s.requestCloser.CloseWithNetworkError(s.p, s.request.ID())
+		case messagequeue.Sent:
 			s.blockSentListeners.NotifyBlockSentListeners(s.p, s.request, blockData)
 		}
-		responseCode := responseEvent.Metadata.ResponseCodes[s.request.ID()]
-		if responseCode.IsTerminal() {
-			s.requestCloser.TerminateRequest(s.request.ID())
-			s.completedListeners.NotifyCompletedListeners(s.p, s.request, responseCode)
+		return
+	}
+	status, isStatus := topic.(graphsync.ResponseStatusCode)
+	if isStatus {
+		s.connManager.Unprotect(s.p, s.request.ID().Tag())
+		switch responseEvent.Name {
+		case messagequeue.Error:
+			s.networkErrorListeners.NotifyNetworkErrorListeners(s.p, s.request, responseEvent.Err)
+			s.requestCloser.CloseWithNetworkError(s.p, s.request.ID())
+		case messagequeue.Sent:
+			s.completedListeners.NotifyCompletedListeners(s.p, s.request, status)
 		}
 	}
 }
 
-func (s *subscriber) OnClose(_ notifications.Topic) {
+func (s *subscriber) OnClose(topic notifications.Topic) {
 
 }

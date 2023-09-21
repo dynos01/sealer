@@ -8,15 +8,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/network"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/protocol"
 
 	logging "github.com/ipfs/go-log"
 	"github.com/libp2p/go-msgio"
-
-	//lint:ignore SA1019 TODO migrate away from gogo pb
 	"github.com/libp2p/go-msgio/protoio"
 
 	"go.opencensus.io/stats"
@@ -43,7 +41,7 @@ type messageSenderImpl struct {
 	protocols []protocol.ID
 }
 
-func NewMessageSenderImpl(h host.Host, protos []protocol.ID) pb.MessageSenderWithDisconnect {
+func NewMessageSenderImpl(h host.Host, protos []protocol.ID) pb.MessageSender {
 	return &messageSenderImpl{
 		host:      h,
 		strmap:    make(map[peer.ID]*peerMessageSender),

@@ -4,15 +4,15 @@ import (
 	"context"
 	"time"
 
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/protocol"
 
 	gsmsg "github.com/ipfs/go-graphsync/message"
 )
 
 var (
 	// ProtocolGraphsync is the protocol identifier for graphsync messages
-	ProtocolGraphsync_2_0_0 protocol.ID = "/ipfs/graphsync/2.0.0"
+	ProtocolGraphsync protocol.ID = "/ipfs/graphsync/1.0.0"
 )
 
 // GraphSyncNetwork provides network connectivity for GraphSync.
