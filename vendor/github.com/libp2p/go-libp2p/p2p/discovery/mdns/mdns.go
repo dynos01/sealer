@@ -5,15 +5,15 @@ import (
 	"errors"
 	"io"
 	"math/rand"
+	"net"
 	"strings"
 	"sync"
 
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer"
-
+	logging "github.com/ipfs/go-log/v2"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/zeroconf/v2"
 
-	logging "github.com/ipfs/go-log/v2"
 	ma "github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
 )
@@ -86,14 +86,18 @@ func (s *mdnsService) Close() error {
 func (s *mdnsService) getIPs(addrs []ma.Multiaddr) ([]string, error) {
 	var ip4, ip6 string
 	for _, addr := range addrs {
-		first, _ := ma.SplitFirst(addr)
-		if first == nil {
+		network, hostport, err := manet.DialArgs(addr)
+		if err != nil {
 			continue
 		}
-		if ip4 == "" && first.Protocol().Code == ma.P_IP4 {
-			ip4 = first.Value()
-		} else if ip6 == "" && first.Protocol().Code == ma.P_IP6 {
-			ip6 = first.Value()
+		host, _, err := net.SplitHostPort(hostport)
+		if err != nil {
+			continue
+		}
+		if ip4 == "" && (network == "udp4" || network == "tcp4") {
+			ip4 = host
+		} else if ip6 == "" && (network == "udp6" || network == "tcp6") {
+			ip6 = host
 		}
 	}
 	ips := make([]string, 0, 2)
@@ -177,9 +181,6 @@ func (s *mdnsService) startResolver(ctx context.Context) {
 				continue
 			}
 			for _, info := range infos {
-				if info.ID == s.host.ID() {
-					continue
-				}
 				go s.notifee.HandlePeerFound(info)
 			}
 		}

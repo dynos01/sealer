@@ -1,7 +1,6 @@
 package ssdp
 
 import (
-	"context"
 	"errors"
 	"log"
 	"net/http"
@@ -35,15 +34,14 @@ type HTTPUClient interface {
 	) ([]*http.Response, error)
 }
 
-// SSDPRawSearchCtx performs a fairly raw SSDP search request, and returns the
+// SSDPRawSearch performs a fairly raw SSDP search request, and returns the
 // unique response(s) that it receives. Each response has the requested
 // searchTarget, a USN, and a valid location. maxWaitSeconds states how long to
 // wait for responses in seconds, and must be a minimum of 1 (the
 // implementation waits an additional 100ms for responses to arrive), 2 is a
 // reasonable value for this. numSends is the number of requests to send - 3 is
 // a reasonable value for this.
-func SSDPRawSearchCtx(
-	ctx context.Context,
+func SSDPRawSearch(
 	httpu HTTPUClient,
 	searchTarget string,
 	maxWaitSeconds int,
@@ -53,7 +51,7 @@ func SSDPRawSearchCtx(
 		return nil, errors.New("ssdp: maxWaitSeconds must be >= 1")
 	}
 
-	req := (&http.Request{
+	req := http.Request{
 		Method: methodSearch,
 		// TODO: Support both IPv4 and IPv6.
 		Host: ssdpUDP4Addr,
@@ -66,8 +64,8 @@ func SSDPRawSearchCtx(
 			"MAN":  []string{ssdpDiscover},
 			"ST":   []string{searchTarget},
 		},
-	}).WithContext(ctx)
-	allResponses, err := httpu.Do(req, time.Duration(maxWaitSeconds)*time.Second+100*time.Millisecond, numSends)
+	}
+	allResponses, err := httpu.Do(&req, time.Duration(maxWaitSeconds)*time.Second+100*time.Millisecond, numSends)
 	if err != nil {
 		return nil, err
 	}
@@ -98,10 +96,4 @@ func SSDPRawSearchCtx(
 	}
 
 	return responses, nil
-}
-
-// SSDPRawSearch is the legacy version of SSDPRawSearchCtx, but uses
-// context.Background() as the context.
-func SSDPRawSearch(httpu HTTPUClient, searchTarget string, maxWaitSeconds int, numSends int) ([]*http.Response, error) {
-	return SSDPRawSearchCtx(context.Background(), httpu, searchTarget, maxWaitSeconds, numSends)
 }

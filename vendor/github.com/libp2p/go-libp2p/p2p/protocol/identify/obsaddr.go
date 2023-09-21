@@ -3,16 +3,15 @@ package identify
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
-	"golang.org/x/exp/slices"
-
-	"github.com/libp2p/go-libp2p/core/event"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peerstore"
-	"github.com/libp2p/go-libp2p/p2p/host/eventbus"
+	"github.com/libp2p/go-eventbus"
+	"github.com/libp2p/go-libp2p-core/event"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/network"
+	"github.com/libp2p/go-libp2p-core/peerstore"
 
 	ma "github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
@@ -52,9 +51,9 @@ type observation struct {
 
 // observedAddr is an entry for an address reported by our peers.
 // We only use addresses that:
-//   - have been observed at least 4 times in last 40 minutes. (counter symmetric nats)
-//   - have been observed at least once recently (10 minutes), because our position in the
-//     network, or network port mapppings, may have changed.
+// - have been observed at least 4 times in last 40 minutes. (counter symmetric nats)
+// - have been observed at least once recently (10 minutes), because our position in the
+//   network, or network port mapppings, may have changed.
 type observedAddr struct {
 	addr       ma.Multiaddr
 	seenBy     map[string]observation // peer(observer) address -> observation info
@@ -142,7 +141,7 @@ func NewObservedAddrManager(host host.Host) (*ObservedAddrManager, error) {
 	}
 	oas.ctx, oas.ctxCancel = context.WithCancel(context.Background())
 
-	reachabilitySub, err := host.EventBus().Subscribe(new(event.EvtLocalReachabilityChanged), eventbus.Name("identify (obsaddr)"))
+	reachabilitySub, err := host.EventBus().Subscribe(new(event.EvtLocalReachabilityChanged))
 	if err != nil {
 		return nil, fmt.Errorf("failed to subscribe to reachability event: %s", err)
 	}
@@ -214,10 +213,14 @@ func (oas *ObservedAddrManager) filter(observedAddrs []*observedAddr) []ma.Multi
 
 		// We prefer inbound connection observations over outbound.
 		// For ties, we prefer the ones with more votes.
-		slices.SortFunc(s, func(first, second *observedAddr) bool {
+		sort.Slice(s, func(i int, j int) bool {
+			first := s[i]
+			second := s[j]
+
 			if first.numInbound > second.numInbound {
 				return true
 			}
+
 			return len(first.seenBy) > len(second.seenBy)
 		})
 
@@ -353,104 +356,53 @@ func (oas *ObservedAddrManager) removeConn(conn network.Conn) {
 	oas.activeConnsMu.Unlock()
 }
 
-type normalizeMultiaddrer interface {
-	NormalizeMultiaddr(addr ma.Multiaddr) ma.Multiaddr
-}
-
-type addrsProvider interface {
-	Addrs() []ma.Multiaddr
-}
-
-type listenAddrsProvider interface {
-	ListenAddresses() []ma.Multiaddr
-	InterfaceListenAddresses() ([]ma.Multiaddr, error)
-}
-
-func shouldRecordObservation(host addrsProvider, network listenAddrsProvider, conn network.ConnMultiaddrs, observed ma.Multiaddr) bool {
+func (oas *ObservedAddrManager) maybeRecordObservation(conn network.Conn, observed ma.Multiaddr) {
 	// First, determine if this observation is even worth keeping...
 
 	// Ignore observations from loopback nodes. We already know our loopback
 	// addresses.
 	if manet.IsIPLoopback(observed) {
-		return false
-	}
-
-	// Provided by NAT64 peers, these addresses are specific to the peer and not publicly routable
-	if manet.IsNAT64IPv4ConvertedIPv6Addr(observed) {
-		return false
+		return
 	}
 
 	// we should only use ObservedAddr when our connection's LocalAddr is one
 	// of our ListenAddrs. If we Dial out using an ephemeral addr, knowing that
 	// address's external mapping is not very useful because the port will not be
 	// the same as the listen addr.
-	ifaceaddrs, err := network.InterfaceListenAddresses()
+	ifaceaddrs, err := oas.host.Network().InterfaceListenAddresses()
 	if err != nil {
 		log.Infof("failed to get interface listen addrs", err)
-		return false
-	}
-
-	normalizer, canNormalize := host.(normalizeMultiaddrer)
-
-	if canNormalize {
-		for i, a := range ifaceaddrs {
-			ifaceaddrs[i] = normalizer.NormalizeMultiaddr(a)
-		}
+		return
 	}
 
 	local := conn.LocalMultiaddr()
-	if canNormalize {
-		local = normalizer.NormalizeMultiaddr(local)
-	}
-
-	listenAddrs := network.ListenAddresses()
-	if canNormalize {
-		for i, a := range listenAddrs {
-			listenAddrs[i] = normalizer.NormalizeMultiaddr(a)
-		}
-	}
-
-	if !ma.Contains(ifaceaddrs, local) && !ma.Contains(listenAddrs, local) {
+	if !addrInAddrs(local, ifaceaddrs) && !addrInAddrs(local, oas.host.Network().ListenAddresses()) {
 		// not in our list
-		return false
-	}
-
-	hostAddrs := host.Addrs()
-	if canNormalize {
-		for i, a := range hostAddrs {
-			hostAddrs[i] = normalizer.NormalizeMultiaddr(a)
-		}
+		return
 	}
 
 	// We should reject the connection if the observation doesn't match the
 	// transports of one of our advertised addresses.
-	if !HasConsistentTransport(observed, hostAddrs) &&
-		!HasConsistentTransport(observed, listenAddrs) {
+	if !HasConsistentTransport(observed, oas.host.Addrs()) {
 		log.Debugw(
 			"observed multiaddr doesn't match the transports of any announced addresses",
 			"from", conn.RemoteMultiaddr(),
 			"observed", observed,
 		)
-		return false
+		return
 	}
 
-	return true
-}
+	// Ok, the observation is good, record it.
+	log.Debugw("added own observed listen addr", "observed", observed)
 
-func (oas *ObservedAddrManager) maybeRecordObservation(conn network.Conn, observed ma.Multiaddr) {
-	shouldRecord := shouldRecordObservation(oas.host, oas.host.Network(), conn, observed)
-	if shouldRecord {
-		// Ok, the observation is good, record it.
-		log.Debugw("added own observed listen addr", "observed", observed)
-		defer oas.addConn(conn, observed)
+	defer oas.addConn(conn, observed)
 
-		oas.mu.Lock()
-		defer oas.mu.Unlock()
-		oas.recordObservationUnlocked(conn, observed)
+	oas.mu.Lock()
+	defer oas.mu.Unlock()
+	oas.recordObservationUnlocked(conn, observed)
 
-		if oas.reachability == network.ReachabilityPrivate {
-			oas.emitAllNATTypes()
-		}
+	if oas.reachability == network.ReachabilityPrivate {
+		oas.emitAllNATTypes()
 	}
 }
 
@@ -603,7 +555,7 @@ func (oas *ObservedAddrManager) Close() error {
 // Here, we use the root multiaddr address. This is mostly
 // IP addresses. In practice, this is what we want.
 func observerGroup(m ma.Multiaddr) string {
-	// TODO: If IPv6 rolls out we should mark /64 routing zones as one group
+	//TODO: If IPv6 rolls out we should mark /64 routing zones as one group
 	first, _ := ma.SplitFirst(m)
 	return string(first.Bytes())
 }
@@ -635,3 +587,5 @@ func (on *obsAddrNotifiee) Connected(n network.Network, v network.Conn)   {}
 func (on *obsAddrNotifiee) Disconnected(n network.Network, v network.Conn) {
 	(*ObservedAddrManager)(on).removeConn(v)
 }
+func (on *obsAddrNotifiee) OpenedStream(n network.Network, s network.Stream) {}
+func (on *obsAddrNotifiee) ClosedStream(n network.Network, s network.Stream) {}

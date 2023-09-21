@@ -14,18 +14,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ipfs/boxo/coreiface/options"
-	"github.com/ipfs/boxo/coreiface/path"
-	"github.com/ipfs/boxo/files"
-	"github.com/ipfs/kubo/config"
-	"github.com/ipfs/kubo/core"
-	"github.com/ipfs/kubo/core/coreapi"
-	"github.com/ipfs/kubo/core/node/libp2p"
-	"github.com/ipfs/kubo/plugin/loader"
-	"github.com/ipfs/kubo/repo/fsrepo"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/peerstore"
+	config "github.com/ipfs/go-ipfs-config"
+	files "github.com/ipfs/go-ipfs-files"
+	"github.com/ipfs/go-ipfs/core"
+	"github.com/ipfs/go-ipfs/core/coreapi"
+	"github.com/ipfs/go-ipfs/core/node/libp2p"
+	"github.com/ipfs/go-ipfs/plugin/loader"
+	"github.com/ipfs/go-ipfs/repo/fsrepo"
+	"github.com/ipfs/interface-go-ipfs-core/options"
+	"github.com/ipfs/interface-go-ipfs-core/path"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/peerstore"
 	"github.com/sealerio/sealer/pkg/env"
 	"github.com/sealerio/sealer/pkg/infradriver"
 	"github.com/sirupsen/logrus"
@@ -33,7 +33,7 @@ import (
 
 	b64 "encoding/base64"
 
-	icore "github.com/ipfs/boxo/coreiface"
+	icore "github.com/ipfs/interface-go-ipfs-core"
 	lp2p "github.com/libp2p/go-libp2p"
 	sealerConfig "github.com/sealerio/sealer/pkg/config"
 	v1 "github.com/sealerio/sealer/types/api/v1"
@@ -80,8 +80,6 @@ func (p *p2pDistributor) Distribute(hosts []net.IP, dest string) error {
 
 		p.distributeImpl(hosts, info.MountDir, dest)
 	}
-
-	logrus.Warnf("OKAY!")
 
 	return nil
 }

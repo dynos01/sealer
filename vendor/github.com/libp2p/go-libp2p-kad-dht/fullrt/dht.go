@@ -3,7 +3,6 @@ package fullrt
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -14,19 +13,18 @@ import (
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
 
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/peerstore"
-	"github.com/libp2p/go-libp2p/core/protocol"
-	"github.com/libp2p/go-libp2p/core/routing"
-	swarm "github.com/libp2p/go-libp2p/p2p/net/swarm"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/network"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/peerstore"
+	"github.com/libp2p/go-libp2p-core/protocol"
+	"github.com/libp2p/go-libp2p-core/routing"
 
 	"github.com/gogo/protobuf/proto"
-	u "github.com/ipfs/boxo/util"
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
+	u "github.com/ipfs/go-ipfs-util"
 	logging "github.com/ipfs/go-log"
 
 	kaddht "github.com/libp2p/go-libp2p-kad-dht"
@@ -44,14 +42,14 @@ import (
 	"github.com/libp2p/go-libp2p-xor/kademlia"
 	kadkey "github.com/libp2p/go-libp2p-xor/key"
 	"github.com/libp2p/go-libp2p-xor/trie"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
-var logger = logging.Logger("fullrtdht")
+var Tracer = otel.Tracer("")
 
-const rtRefreshLimitsMsg = `Accelerated DHT client was unable to fully refresh its routing table due to Resource Manager limits, which may degrade content routing. Consider increasing resource limits. See debug logs for the "dht-crawler" subsystem for details.`
+var logger = logging.Logger("fullrtdht")
 
 // FullRT is an experimental DHT client that is under development. Expect breaking changes to occur in this client
 // until it stabilizes.
@@ -69,7 +67,7 @@ type FullRT struct {
 	crawlerInterval time.Duration
 	lastCrawlTime   time.Time
 
-	crawler        crawler.Crawler
+	crawler        *crawler.Crawler
 	protoMessenger *dht_pb.ProtocolMessenger
 	messageSender  dht_pb.MessageSender
 
@@ -93,8 +91,6 @@ type FullRT struct {
 	timeoutPerOp time.Duration
 
 	bulkSendParallelism int
-
-	self peer.ID
 }
 
 // NewFullRT creates a DHT client that tracks the full network. It takes a protocol prefix for the given network,
@@ -105,12 +101,7 @@ type FullRT struct {
 //
 // Not all of the standard DHT options are supported in this DHT.
 func NewFullRT(h host.Host, protocolPrefix protocol.ID, options ...Option) (*FullRT, error) {
-	fullrtcfg := config{
-		crawlInterval:       time.Hour,
-		bulkSendParallelism: 20,
-		waitFrac:            0.3,
-		timeoutPerOp:        5 * time.Second,
-	}
+	var fullrtcfg config
 	if err := fullrtcfg.apply(options...); err != nil {
 		return nil, err
 	}
@@ -141,17 +132,14 @@ func NewFullRT(h host.Host, protocolPrefix protocol.ID, options ...Option) (*Ful
 		return nil, err
 	}
 
-	if fullrtcfg.crawler == nil {
-		fullrtcfg.crawler, err = crawler.NewDefaultCrawler(h, crawler.WithParallelism(200))
-		if err != nil {
-			return nil, err
-		}
+	c, err := crawler.New(h, crawler.WithParallelism(200))
+	if err != nil {
+		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	self := h.ID()
-	pm, err := providers.NewProviderManager(self, h.Peerstore(), dhtcfg.Datastore, fullrtcfg.pmOpts...)
+	pm, err := providers.NewProviderManager(ctx, h.ID(), h.Peerstore(), dhtcfg.Datastore)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -174,7 +162,7 @@ func NewFullRT(h host.Host, protocolPrefix protocol.ID, options ...Option) (*Ful
 		ProviderManager: pm,
 		datastore:       dhtcfg.Datastore,
 		h:               h,
-		crawler:         fullrtcfg.crawler,
+		crawler:         c,
 		messageSender:   ms,
 		protoMessenger:  protoMessenger,
 		filterFromTable: kaddht.PublicQueryFilter,
@@ -187,14 +175,12 @@ func NewFullRT(h host.Host, protocolPrefix protocol.ID, options ...Option) (*Ful
 
 		triggerRefresh: make(chan struct{}),
 
-		waitFrac:     fullrtcfg.waitFrac,
-		timeoutPerOp: fullrtcfg.timeoutPerOp,
+		waitFrac:     0.3,
+		timeoutPerOp: 5 * time.Second,
 
-		crawlerInterval: fullrtcfg.crawlInterval,
+		crawlerInterval: time.Minute * 60,
 
-		bulkSendParallelism: fullrtcfg.bulkSendParallelism,
-
-		self: self,
+		bulkSendParallelism: 20,
 	}
 
 	rt.wg.Add(1)
@@ -285,7 +271,6 @@ func (dht *FullRT) runCrawler(ctx context.Context) {
 		}
 
 		start := time.Now()
-		limitErrOnce := sync.Once{}
 		dht.crawler.Run(ctx, addrs,
 			func(p peer.ID, rtPeers []*peer.AddrInfo) {
 				conns := dht.h.Network().ConnsToPeer(p)
@@ -311,20 +296,7 @@ func (dht *FullRT) runCrawler(ctx context.Context) {
 					addrs: addrs,
 				}
 			},
-			func(p peer.ID, err error) {
-				dialErr, ok := err.(*swarm.DialError)
-				if ok {
-					for _, transportErr := range dialErr.DialErrors {
-						if errors.Is(transportErr.Cause, network.ErrResourceLimitExceeded) {
-							limitErrOnce.Do(func() { logger.Errorf(rtRefreshLimitsMsg) })
-						}
-					}
-				}
-				// note that DialError implements Unwrap() which returns the Cause, so this covers that case
-				if errors.Is(err, network.ErrResourceLimitExceeded) {
-					limitErrOnce.Do(func() { logger.Errorf(rtRefreshLimitsMsg) })
-				}
-			})
+			func(p peer.ID, err error) {})
 		dur := time.Since(start)
 		logger.Infof("crawl took %v", dur)
 
@@ -355,8 +327,9 @@ func (dht *FullRT) runCrawler(ctx context.Context) {
 
 func (dht *FullRT) Close() error {
 	dht.cancel()
+	err := dht.ProviderManager.Process().Close()
 	dht.wg.Wait()
-	return dht.ProviderManager.Close()
+	return err
 }
 
 func (dht *FullRT) Bootstrap(ctx context.Context) error {
@@ -365,9 +338,6 @@ func (dht *FullRT) Bootstrap(ctx context.Context) error {
 
 // CheckPeers return (success, total)
 func (dht *FullRT) CheckPeers(ctx context.Context, peers ...peer.ID) (int, int) {
-	ctx, span := internal.StartSpan(ctx, "FullRT.CheckPeers", trace.WithAttributes(attribute.Int("NumPeers", len(peers))))
-	defer span.End()
-
 	var peerAddrs chan interface{}
 	var total int
 	if len(peers) == 0 {
@@ -425,7 +395,8 @@ func workers(numWorkers int, fn func(interface{}), inputs <-chan interface{}) {
 }
 
 func (dht *FullRT) GetClosestPeers(ctx context.Context, key string) ([]peer.ID, error) {
-	_, span := internal.StartSpan(ctx, "FullRT.GetClosestPeers", trace.WithAttributes(internal.KeyAsAttribute("Key", key)))
+	ctx, span := Tracer.Start(ctx, "GetClosestPeers")
+	_ = ctx // not used, but we want to assign it _just_ in case we use it.
 	defer span.End()
 
 	kbID := kb.ConvertKey(key)
@@ -554,14 +525,6 @@ func (dht *FullRT) GetValue(ctx context.Context, key string, opts ...routing.Opt
 
 // SearchValue searches for the value corresponding to given Key and streams the results.
 func (dht *FullRT) SearchValue(ctx context.Context, key string, opts ...routing.Option) (<-chan []byte, error) {
-	ctx, span := internal.StartSpan(ctx, "FullRT.SearchValue", trace.WithAttributes(internal.KeyAsAttribute("Key", key)))
-	var good bool
-	defer func() {
-		if !good {
-			span.End()
-		}
-	}()
-
 	if !dht.enableValues {
 		return nil, routing.ErrNotSupported
 	}
@@ -580,11 +543,8 @@ func (dht *FullRT) SearchValue(ctx context.Context, key string, opts ...routing.
 	valCh, lookupRes := dht.getValues(ctx, key, stopCh)
 
 	out := make(chan []byte)
-	good = true
 	go func() {
-		defer span.End()
 		defer close(out)
-
 		best, peersWithBest, aborted := dht.searchValueQuorum(ctx, key, valCh, stopCh, out, responsesNeeded)
 		if best == nil || aborted {
 			return
@@ -606,7 +566,7 @@ func (dht *FullRT) SearchValue(ctx context.Context, key string, opts ...routing.
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(ctx, time.Second*5)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 		dht.updatePeerValues(ctx, key, best, updatePeers)
 		cancel()
 	}()
@@ -683,7 +643,7 @@ func (dht *FullRT) updatePeerValues(ctx context.Context, key string, val []byte,
 	fixupRec := record.MakePutRecord(key, val)
 	for _, p := range peers {
 		go func(p peer.ID) {
-			// TODO: Is this possible?
+			//TODO: Is this possible?
 			if p == dht.h.ID() {
 				err := dht.putLocal(ctx, key, fixupRec)
 				if err != nil {
@@ -790,7 +750,7 @@ func (dht *FullRT) getValues(ctx context.Context, key string, stopQuery chan str
 
 // Provide makes this node announce that it can provide a value for the given key
 func (dht *FullRT) Provide(ctx context.Context, key cid.Cid, brdcst bool) (err error) {
-	ctx, span := internal.StartSpan(ctx, "FullRT.Provide", trace.WithAttributes(attribute.Stringer("Key", key), attribute.Bool("Broadcast", brdcst)))
+	ctx, span := Tracer.Start(ctx, "Provide")
 	defer span.End()
 
 	if !dht.enableProviders {
@@ -868,6 +828,9 @@ func (dht *FullRT) Provide(ctx context.Context, key cid.Cid, brdcst bool) (err e
 // execOnMany has returned (e.g. do not write to resources that might get closed or set to nil and therefore result in
 // a panic instead of just returning an error).
 func (dht *FullRT) execOnMany(ctx context.Context, fn func(context.Context, peer.ID) error, peers []peer.ID, sloppyExit bool) int {
+	ctx, span := Tracer.Start(ctx, "execOnMany")
+	defer span.End()
+
 	if len(peers) == 0 {
 		return 0
 	}
@@ -931,7 +894,7 @@ func (dht *FullRT) execOnMany(ctx context.Context, fn func(context.Context, peer
 }
 
 func (dht *FullRT) ProvideMany(ctx context.Context, keys []multihash.Multihash) error {
-	ctx, span := internal.StartSpan(ctx, "FullRT.ProvideMany", trace.WithAttributes(attribute.Int("NumKeys", len(keys))))
+	ctx, span := Tracer.Start(ctx, "ProvideMany")
 	defer span.End()
 
 	if !dht.enableProviders {
@@ -967,9 +930,6 @@ func (dht *FullRT) ProvideMany(ctx context.Context, keys []multihash.Multihash) 
 }
 
 func (dht *FullRT) PutMany(ctx context.Context, keys []string, values [][]byte) error {
-	ctx, span := internal.StartSpan(ctx, "FullRT.PutMany", trace.WithAttributes(attribute.Int("NumKeys", len(keys))))
-	defer span.End()
-
 	if !dht.enableValues {
 		return routing.ErrNotSupported
 	}
@@ -998,7 +958,7 @@ func (dht *FullRT) PutMany(ctx context.Context, keys []string, values [][]byte) 
 }
 
 func (dht *FullRT) bulkMessageSend(ctx context.Context, keys []peer.ID, fn func(ctx context.Context, target, k peer.ID) error, isProvRec bool) error {
-	ctx, span := internal.StartSpan(ctx, "FullRT.BulkMessageSend")
+	ctx, span := Tracer.Start(ctx, "bulkMessageSend", trace.WithAttributes(attribute.Int("numKeys", len(keys))))
 	defer span.End()
 
 	if len(keys) == 0 {
@@ -1239,28 +1199,14 @@ func (dht *FullRT) FindProvidersAsync(ctx context.Context, key cid.Cid, count in
 }
 
 func (dht *FullRT) findProvidersAsyncRoutine(ctx context.Context, key multihash.Multihash, count int, peerOut chan peer.AddrInfo) {
-	ctx, span := internal.StartSpan(ctx, "FullRT.FindProvidersAsyncRoutine", trace.WithAttributes(attribute.Stringer("Key", key)))
-	defer span.End()
-
 	defer close(peerOut)
 
 	findAll := count == 0
-	ps := make(map[peer.ID]struct{})
-	psLock := &sync.Mutex{}
-	psTryAdd := func(p peer.ID) bool {
-		psLock.Lock()
-		defer psLock.Unlock()
-		_, ok := ps[p]
-		if !ok && (len(ps) < count || findAll) {
-			ps[p] = struct{}{}
-			return true
-		}
-		return false
-	}
-	psSize := func() int {
-		psLock.Lock()
-		defer psLock.Unlock()
-		return len(ps)
+	var ps *peer.Set
+	if findAll {
+		ps = peer.NewSet()
+	} else {
+		ps = peer.NewLimitedSet(count)
 	}
 
 	provs, err := dht.ProviderManager.GetProviders(ctx, key)
@@ -1269,13 +1215,9 @@ func (dht *FullRT) findProvidersAsyncRoutine(ctx context.Context, key multihash.
 	}
 	for _, p := range provs {
 		// NOTE: Assuming that this list of peers is unique
-		if psTryAdd(p.ID) {
+		if ps.TryAdd(p.ID) {
 			select {
 			case peerOut <- p:
-				span.AddEvent("found provider", trace.WithAttributes(
-					attribute.Stringer("peer", p.ID),
-					attribute.Stringer("from", dht.self),
-				))
 			case <-ctx.Done():
 				return
 			}
@@ -1283,7 +1225,7 @@ func (dht *FullRT) findProvidersAsyncRoutine(ctx context.Context, key multihash.
 
 		// If we have enough peers locally, don't bother with remote RPC
 		// TODO: is this a DOS vector?
-		if !findAll && psSize() >= count {
+		if !findAll && ps.Size() >= count {
 			return
 		}
 	}
@@ -1303,16 +1245,10 @@ func (dht *FullRT) findProvidersAsyncRoutine(ctx context.Context, key multihash.
 			ID:   p,
 		})
 
-		mctx, mspan := internal.StartSpan(ctx, "protoMessenger.GetProviders", trace.WithAttributes(attribute.Stringer("peer", p)))
-		provs, closest, err := dht.protoMessenger.GetProviders(mctx, p, key)
+		provs, closest, err := dht.protoMessenger.GetProviders(ctx, p, key)
 		if err != nil {
-			if mspan.IsRecording() {
-				mspan.SetStatus(codes.Error, err.Error())
-			}
-			mspan.End()
 			return err
 		}
-		mspan.End()
 
 		logger.Debugf("%d provider entries", len(provs))
 
@@ -1320,21 +1256,17 @@ func (dht *FullRT) findProvidersAsyncRoutine(ctx context.Context, key multihash.
 		for _, prov := range provs {
 			dht.maybeAddAddrs(prov.ID, prov.Addrs, peerstore.TempAddrTTL)
 			logger.Debugf("got provider: %s", prov)
-			if psTryAdd(prov.ID) {
+			if ps.TryAdd(prov.ID) {
 				logger.Debugf("using provider: %s", prov)
 				select {
 				case peerOut <- *prov:
-					span.AddEvent("found provider", trace.WithAttributes(
-						attribute.Stringer("peer", prov.ID),
-						attribute.Stringer("from", p),
-					))
 				case <-ctx.Done():
 					logger.Debug("context timed out sending more providers")
 					return ctx.Err()
 				}
 			}
-			if !findAll && psSize() >= count {
-				logger.Debugf("got enough providers (%d/%d)", psSize(), count)
+			if !findAll && ps.Size() >= count {
+				logger.Debugf("got enough providers (%d/%d)", ps.Size(), count)
 				cancelquery()
 				return nil
 			}
@@ -1356,9 +1288,6 @@ func (dht *FullRT) findProvidersAsyncRoutine(ctx context.Context, key multihash.
 
 // FindPeer searches for a peer with given ID.
 func (dht *FullRT) FindPeer(ctx context.Context, id peer.ID) (_ peer.AddrInfo, err error) {
-	ctx, span := internal.StartSpan(ctx, "FullRT.FindPeer", trace.WithAttributes(attribute.Stringer("PeerID", id)))
-	defer span.End()
-
 	if err := id.Validate(); err != nil {
 		return peer.AddrInfo{}, err
 	}

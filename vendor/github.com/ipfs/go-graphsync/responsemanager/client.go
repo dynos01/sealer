@@ -3,22 +3,17 @@ package responsemanager
 import (
 	"context"
 	"errors"
-	"time"
 
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/ipfs/go-peertaskqueue/peertask"
 	ipld "github.com/ipld/go-ipld-prime"
-	"github.com/ipld/go-ipld-prime/traversal"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"go.opentelemetry.io/otel/trace"
+	"github.com/libp2p/go-libp2p-core/peer"
 
 	"github.com/ipfs/go-graphsync"
 	"github.com/ipfs/go-graphsync/ipldutil"
 	gsmsg "github.com/ipfs/go-graphsync/message"
 	"github.com/ipfs/go-graphsync/network"
 	"github.com/ipfs/go-graphsync/notifications"
-	"github.com/ipfs/go-graphsync/panics"
-	"github.com/ipfs/go-graphsync/peerstate"
 	"github.com/ipfs/go-graphsync/responsemanager/hooks"
 	"github.com/ipfs/go-graphsync/responsemanager/queryexecutor"
 	"github.com/ipfs/go-graphsync/responsemanager/responseassembler"
@@ -31,26 +26,39 @@ import (
 
 var log = logging.Logger("graphsync")
 
+type state uint64
+
+const (
+	queued state = iota
+	running
+	paused
+)
+
 type inProgressResponseStatus struct {
-	ctx            context.Context
-	span           trace.Span
-	cancelFn       func()
-	peer           peer.ID
-	request        gsmsg.GraphSyncRequest
-	linkSystem     ipld.LinkSystem
-	customChooser  traversal.LinkTargetNodePrototypeChooser
-	maxLinks       uint64
-	traverser      ipldutil.Traverser
-	signals        queryexecutor.ResponseSignals
-	updates        []gsmsg.GraphSyncRequest
-	state          graphsync.RequestState
-	startTime      time.Time
-	responseStream responseassembler.ResponseStream
+	ctx        context.Context
+	cancelFn   func()
+	request    gsmsg.GraphSyncRequest
+	loader     ipld.BlockReadOpener
+	traverser  ipldutil.Traverser
+	signals    queryexecutor.ResponseSignals
+	updates    []gsmsg.GraphSyncRequest
+	state      state
+	subscriber *notifications.TopicDataSubscriber
+}
+
+type responseKey struct {
+	p         peer.ID
+	requestID graphsync.RequestID
 }
 
 // RequestHooks is an interface for processing request hooks
 type RequestHooks interface {
-	ProcessRequestHooks(p peer.ID, request graphsync.RequestData, ctx context.Context) hooks.RequestResult
+	ProcessRequestHooks(p peer.ID, request graphsync.RequestData) hooks.RequestResult
+}
+
+// RequestQueuedHooks is an interface for processing request queued hooks
+type RequestQueuedHooks interface {
+	ProcessRequestQueuedHooks(p peer.ID, request graphsync.RequestData)
 }
 
 // UpdateHooks is an interface for processing update hooks
@@ -73,11 +81,6 @@ type BlockSentListeners interface {
 	NotifyBlockSentListeners(p peer.ID, request graphsync.RequestData, block graphsync.BlockData)
 }
 
-// RequestProcessingListeners is an interface for notifying listeners a request has begun processing
-type RequestProcessingListeners interface {
-	NotifyRequestProcessingListeners(p peer.ID, request graphsync.RequestData, inProgressRequestCount int)
-}
-
 // NetworkErrorListeners is an interface for notifying listeners that an error occurred sending a data on the wire
 type NetworkErrorListeners interface {
 	NotifyNetworkErrorListeners(p peer.ID, request graphsync.RequestData, err error)
@@ -85,7 +88,10 @@ type NetworkErrorListeners interface {
 
 // ResponseAssembler is an interface that returns sender interfaces for peer responses.
 type ResponseAssembler interface {
-	NewStream(ctx context.Context, p peer.ID, requestID graphsync.RequestID, subscriber notifications.Subscriber) responseassembler.ResponseStream
+	DedupKey(p peer.ID, requestID graphsync.RequestID, key string)
+	IgnoreBlocks(p peer.ID, requestID graphsync.RequestID, links []ipld.Link)
+	SkipFirstBlocks(p peer.ID, requestID graphsync.RequestID, skipCount int64)
+	Transaction(p peer.ID, requestID graphsync.RequestID, transaction responseassembler.Transaction) error
 }
 
 type responseManagerMessage interface {
@@ -95,23 +101,23 @@ type responseManagerMessage interface {
 // ResponseManager handles incoming requests from the network, initiates selector
 // traversals, and transmits responses
 type ResponseManager struct {
-	ctx                        context.Context
-	cancelFn                   context.CancelFunc
-	responseAssembler          ResponseAssembler
-	requestHooks               RequestHooks
-	linkSystem                 ipld.LinkSystem
-	requestProcessingListeners RequestProcessingListeners
-	updateHooks                UpdateHooks
-	cancelledListeners         CancelledListeners
-	completedListeners         CompletedListeners
-	blockSentListeners         BlockSentListeners
-	networkErrorListeners      NetworkErrorListeners
-	messages                   chan responseManagerMessage
-	inProgressResponses        map[graphsync.RequestID]*inProgressResponseStatus
-	connManager                network.ConnManager
+	ctx                   context.Context
+	cancelFn              context.CancelFunc
+	responseAssembler     ResponseAssembler
+	requestHooks          RequestHooks
+	linkSystem            ipld.LinkSystem
+	requestQueuedHooks    RequestQueuedHooks
+	updateHooks           UpdateHooks
+	cancelledListeners    CancelledListeners
+	completedListeners    CompletedListeners
+	blockSentListeners    BlockSentListeners
+	networkErrorListeners NetworkErrorListeners
+	messages              chan responseManagerMessage
+	inProgressResponses   map[responseKey]*inProgressResponseStatus
+	maxInProcessRequests  uint64
+	connManager           network.ConnManager
 	// maximum number of links to traverse per request. A value of zero = infinity, or no limit
 	maxLinksPerRequest uint64
-	panicCallback      panics.CallBackFn
 	responseQueue      taskqueue.TaskQueue
 }
 
@@ -119,54 +125,51 @@ type ResponseManager struct {
 func New(ctx context.Context,
 	linkSystem ipld.LinkSystem,
 	responseAssembler ResponseAssembler,
-	requestProcessingListeners RequestProcessingListeners,
+	requestQueuedHooks RequestQueuedHooks,
 	requestHooks RequestHooks,
 	updateHooks UpdateHooks,
 	completedListeners CompletedListeners,
 	cancelledListeners CancelledListeners,
 	blockSentListeners BlockSentListeners,
 	networkErrorListeners NetworkErrorListeners,
+	maxInProcessRequests uint64,
 	connManager network.ConnManager,
 	maxLinksPerRequest uint64,
-	panicCallback panics.CallBackFn,
 	responseQueue taskqueue.TaskQueue,
 ) *ResponseManager {
 	ctx, cancelFn := context.WithCancel(ctx)
 	messages := make(chan responseManagerMessage, 16)
 	rm := &ResponseManager{
-		ctx:                        ctx,
-		cancelFn:                   cancelFn,
-		requestHooks:               requestHooks,
-		linkSystem:                 linkSystem,
-		responseAssembler:          responseAssembler,
-		requestProcessingListeners: requestProcessingListeners,
-		updateHooks:                updateHooks,
-		cancelledListeners:         cancelledListeners,
-		completedListeners:         completedListeners,
-		blockSentListeners:         blockSentListeners,
-		networkErrorListeners:      networkErrorListeners,
-		messages:                   messages,
-		inProgressResponses:        make(map[graphsync.RequestID]*inProgressResponseStatus),
-		connManager:                connManager,
-		maxLinksPerRequest:         maxLinksPerRequest,
-		responseQueue:              responseQueue,
-		panicCallback:              panicCallback,
+		ctx:                   ctx,
+		cancelFn:              cancelFn,
+		requestHooks:          requestHooks,
+		linkSystem:            linkSystem,
+		responseAssembler:     responseAssembler,
+		requestQueuedHooks:    requestQueuedHooks,
+		updateHooks:           updateHooks,
+		cancelledListeners:    cancelledListeners,
+		completedListeners:    completedListeners,
+		blockSentListeners:    blockSentListeners,
+		networkErrorListeners: networkErrorListeners,
+		messages:              messages,
+		inProgressResponses:   make(map[responseKey]*inProgressResponseStatus),
+		maxInProcessRequests:  maxInProcessRequests,
+		connManager:           connManager,
+		maxLinksPerRequest:    maxLinksPerRequest,
+		responseQueue:         responseQueue,
 	}
 	return rm
 }
 
 // ProcessRequests processes incoming requests for the given peer
 func (rm *ResponseManager) ProcessRequests(ctx context.Context, p peer.ID, requests []gsmsg.GraphSyncRequest) {
-	_ = rm.send(&processRequestsMessage{p, requests}, ctx.Done())
+	rm.send(&processRequestMessage{p, requests}, ctx.Done())
 }
 
 // UnpauseResponse unpauses a response that was previously paused
-func (rm *ResponseManager) UnpauseResponse(ctx context.Context, requestID graphsync.RequestID, extensions ...graphsync.ExtensionData) error {
+func (rm *ResponseManager) UnpauseResponse(p peer.ID, requestID graphsync.RequestID, extensions ...graphsync.ExtensionData) error {
 	response := make(chan error, 1)
-	err := rm.send(&unpauseRequestMessage{requestID, response, extensions}, ctx.Done())
-	if err != nil {
-		return err
-	}
+	rm.send(&unpauseRequestMessage{p, requestID, response, extensions}, nil)
 	select {
 	case <-rm.ctx.Done():
 		return errors.New("context cancelled")
@@ -176,12 +179,9 @@ func (rm *ResponseManager) UnpauseResponse(ctx context.Context, requestID graphs
 }
 
 // PauseResponse pauses an in progress response (may take 1 or more blocks to process)
-func (rm *ResponseManager) PauseResponse(ctx context.Context, requestID graphsync.RequestID) error {
+func (rm *ResponseManager) PauseResponse(p peer.ID, requestID graphsync.RequestID) error {
 	response := make(chan error, 1)
-	err := rm.send(&pauseRequestMessage{requestID, response}, ctx.Done())
-	if err != nil {
-		return err
-	}
+	rm.send(&pauseRequestMessage{p, requestID, response}, nil)
 	select {
 	case <-rm.ctx.Done():
 		return errors.New("context cancelled")
@@ -191,12 +191,9 @@ func (rm *ResponseManager) PauseResponse(ctx context.Context, requestID graphsyn
 }
 
 // CancelResponse cancels an in progress response
-func (rm *ResponseManager) CancelResponse(ctx context.Context, requestID graphsync.RequestID) error {
+func (rm *ResponseManager) CancelResponse(p peer.ID, requestID graphsync.RequestID) error {
 	response := make(chan error, 1)
-	err := rm.send(&errorRequestMessage{requestID, queryexecutor.ErrCancelledByCommand, response}, ctx.Done())
-	if err != nil {
-		return err
-	}
+	rm.send(&errorRequestMessage{p, requestID, queryexecutor.ErrCancelledByCommand, response}, nil)
 	select {
 	case <-rm.ctx.Done():
 		return errors.New("context cancelled")
@@ -205,25 +202,10 @@ func (rm *ResponseManager) CancelResponse(ctx context.Context, requestID graphsy
 	}
 }
 
-// UpdateRequest updates an in progress response
-func (rm *ResponseManager) UpdateResponse(ctx context.Context, requestID graphsync.RequestID, extensions ...graphsync.ExtensionData) error {
-	response := make(chan error, 1)
-	err := rm.send(&updateRequestMessage{requestID, extensions, response}, ctx.Done())
-	if err != nil {
-		return err
-	}
-	select {
-	case <-rm.ctx.Done():
-		return errors.New("context cancelled")
-	case err := <-response:
-		return err
-	}
-}
-
-// Synchronize is a utility method that blocks until all current messages are processed
+// this is a test utility method to force all messages to get processed
 func (rm *ResponseManager) synchronize() {
 	sync := make(chan error)
-	_ = rm.send(&synchronizeMessage{sync}, nil)
+	rm.send(&synchronizeMessage{sync}, nil)
 	select {
 	case <-rm.ctx.Done():
 	case <-sync:
@@ -231,71 +213,30 @@ func (rm *ResponseManager) synchronize() {
 }
 
 // StartTask starts the given task from the peer task queue
-func (rm *ResponseManager) StartTask(task *peertask.Task, p peer.ID, responseTaskChan chan<- queryexecutor.ResponseTask) {
-	_ = rm.send(&startTaskRequest{task, p, responseTaskChan}, nil)
+func (rm *ResponseManager) StartTask(task *peertask.Task, responseTaskChan chan<- queryexecutor.ResponseTask) {
+	rm.send(&startTaskRequest{task, responseTaskChan}, nil)
 }
 
 // GetUpdates is called to read pending updates for a task and clear them
-func (rm *ResponseManager) GetUpdates(requestID graphsync.RequestID, updatesChan chan<- []gsmsg.GraphSyncRequest) {
-	_ = rm.send(&responseUpdateRequest{requestID, updatesChan}, nil)
+func (rm *ResponseManager) GetUpdates(p peer.ID, requestID graphsync.RequestID, updatesChan chan<- []gsmsg.GraphSyncRequest) {
+	rm.send(&responseUpdateRequest{responseKey{p, requestID}, updatesChan}, nil)
 }
 
 // FinishTask marks a task from the task queue as done
-func (rm *ResponseManager) FinishTask(task *peertask.Task, p peer.ID, err error) {
-	done := make(chan struct{}, 1)
-	_ = rm.send(&finishTaskRequest{task, p, err, done}, nil)
-	select {
-	case <-rm.ctx.Done():
-	case <-done:
-	}
+func (rm *ResponseManager) FinishTask(task *peertask.Task, err error) {
+	rm.send(&finishTaskRequest{task, err}, nil)
 }
 
 // CloseWithNetworkError closes a request due to a network error
-func (rm *ResponseManager) CloseWithNetworkError(requestID graphsync.RequestID) {
-	done := make(chan error, 1)
-	_ = rm.send(&errorRequestMessage{requestID, queryexecutor.ErrNetworkError, done}, nil)
-	select {
-	case <-rm.ctx.Done():
-	case <-done:
-	}
+func (rm *ResponseManager) CloseWithNetworkError(p peer.ID, requestID graphsync.RequestID) {
+	rm.send(&errorRequestMessage{p, requestID, queryexecutor.ErrNetworkError, make(chan error, 1)}, nil)
 }
 
-// TerminateRequest indicates a request has finished sending data and should no longer be tracked
-func (rm *ResponseManager) TerminateRequest(requestID graphsync.RequestID) {
-	done := make(chan struct{}, 1)
-	_ = rm.send(&terminateRequestMessage{requestID, done}, nil)
+func (rm *ResponseManager) send(message responseManagerMessage, done <-chan struct{}) {
 	select {
 	case <-rm.ctx.Done():
 	case <-done:
-	}
-}
-
-// PeerState gets current state of the outgoing responses for a given peer
-func (rm *ResponseManager) PeerState(p peer.ID) peerstate.PeerState {
-	response := make(chan peerstate.PeerState)
-	_ = rm.send(&peerStateMessage{p, response}, nil)
-	select {
-	case <-rm.ctx.Done():
-		return peerstate.PeerState{}
-	case peerState := <-response:
-		return peerState
-	}
-}
-
-func (rm *ResponseManager) send(message responseManagerMessage, done <-chan struct{}) error {
-	// prioritize cancelled context
-	select {
-	case <-done:
-		return errors.New("unable to send message before cancellation")
-	default:
-	}
-	select {
-	case <-rm.ctx.Done():
-		return rm.ctx.Err()
-	case <-done:
-		return errors.New("unable to send message before cancellation")
 	case rm.messages <- message:
-		return nil
 	}
 }
 

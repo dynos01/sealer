@@ -2,7 +2,6 @@ package doh
 
 import (
 	"context"
-	"math"
 	"net"
 	"strings"
 	"sync"
@@ -14,13 +13,12 @@ import (
 )
 
 type Resolver struct {
-	mx  sync.Mutex
+	mx sync.Mutex
 	url string
 
 	// RR cache
-	ipCache     map[string]ipAddrEntry
-	txtCache    map[string]txtEntry
-	maxCacheTTL time.Duration
+	ipCache  map[string]ipAddrEntry
+	txtCache map[string]txtEntry
 }
 
 type ipAddrEntry struct {
@@ -33,43 +31,16 @@ type txtEntry struct {
 	expire time.Time
 }
 
-type Option func(*Resolver) error
-
-// Specifies the maximum time entries are valid in the cache
-// A maxCacheTTL of zero is equivalent to `WithCacheDisabled`
-func WithMaxCacheTTL(maxCacheTTL time.Duration) Option {
-	return func(tr *Resolver) error {
-		tr.maxCacheTTL = maxCacheTTL
-		return nil
-	}
-}
-
-func WithCacheDisabled() Option {
-	return func(tr *Resolver) error {
-		tr.maxCacheTTL = 0
-		return nil
-	}
-}
-
-func NewResolver(url string, opts ...Option) (*Resolver, error) {
-	if !strings.HasPrefix(url, "https:") {
+func NewResolver(url string) *Resolver {
+	if !strings.HasPrefix(url, "https://") {
 		url = "https://" + url
 	}
 
-	r := &Resolver{
-		url:         url,
-		ipCache:     make(map[string]ipAddrEntry),
-		txtCache:    make(map[string]txtEntry),
-		maxCacheTTL: time.Duration(math.MaxUint32) * time.Second,
+	return &Resolver{
+		url:      url,
+		ipCache:  make(map[string]ipAddrEntry),
+		txtCache: make(map[string]txtEntry),
 	}
-
-	for _, o := range opts {
-		if err := o(r); err != nil {
-			return nil, err
-		}
-	}
-
-	return r, nil
 }
 
 var _ madns.BasicResolver = (*Resolver)(nil)
@@ -110,8 +81,7 @@ func (r *Resolver) LookupIPAddr(ctx context.Context, domain string) (result []ne
 		}
 	}
 
-	cacheTTL := minTTL(time.Duration(ttl)*time.Second, r.maxCacheTTL)
-	r.cacheIPAddr(domain, result, cacheTTL)
+	r.cacheIPAddr(domain, result, ttl)
 	return result, nil
 }
 
@@ -126,8 +96,7 @@ func (r *Resolver) LookupTXT(ctx context.Context, domain string) ([]string, erro
 		return nil, err
 	}
 
-	cacheTTL := minTTL(time.Duration(ttl)*time.Second, r.maxCacheTTL)
-	r.cacheTXT(domain, result, cacheTTL)
+	r.cacheTXT(domain, result, ttl)
 	return result, nil
 }
 
@@ -149,7 +118,7 @@ func (r *Resolver) getCachedIPAddr(domain string) ([]net.IPAddr, bool) {
 	return entry.ips, true
 }
 
-func (r *Resolver) cacheIPAddr(domain string, ips []net.IPAddr, ttl time.Duration) {
+func (r *Resolver) cacheIPAddr(domain string, ips []net.IPAddr, ttl uint32) {
 	if ttl == 0 {
 		return
 	}
@@ -158,7 +127,7 @@ func (r *Resolver) cacheIPAddr(domain string, ips []net.IPAddr, ttl time.Duratio
 	defer r.mx.Unlock()
 
 	fqdn := dns.Fqdn(domain)
-	r.ipCache[fqdn] = ipAddrEntry{ips, time.Now().Add(ttl)}
+	r.ipCache[fqdn] = ipAddrEntry{ips, time.Now().Add(time.Duration(ttl) * time.Second)}
 }
 
 func (r *Resolver) getCachedTXT(domain string) ([]string, bool) {
@@ -179,7 +148,7 @@ func (r *Resolver) getCachedTXT(domain string) ([]string, bool) {
 	return entry.txt, true
 }
 
-func (r *Resolver) cacheTXT(domain string, txt []string, ttl time.Duration) {
+func (r *Resolver) cacheTXT(domain string, txt []string, ttl uint32) {
 	if ttl == 0 {
 		return
 	}
@@ -188,12 +157,5 @@ func (r *Resolver) cacheTXT(domain string, txt []string, ttl time.Duration) {
 	defer r.mx.Unlock()
 
 	fqdn := dns.Fqdn(domain)
-	r.txtCache[fqdn] = txtEntry{txt, time.Now().Add(ttl)}
-}
-
-func minTTL(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
+	r.txtCache[fqdn] = txtEntry{txt, time.Now().Add(time.Duration(ttl) * time.Second)}
 }

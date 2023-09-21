@@ -2,44 +2,26 @@ package responsemanager
 
 import (
 	"github.com/ipfs/go-peertaskqueue/peertask"
-	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p-core/peer"
 
 	"github.com/ipfs/go-graphsync"
 	gsmsg "github.com/ipfs/go-graphsync/message"
-	"github.com/ipfs/go-graphsync/peerstate"
 	"github.com/ipfs/go-graphsync/responsemanager/queryexecutor"
 )
 
-type processRequestsMessage struct {
+type processRequestMessage struct {
 	p        peer.ID
 	requests []gsmsg.GraphSyncRequest
 }
 
-func (prm *processRequestsMessage) handle(rm *ResponseManager) {
-	rm.processRequests(prm.p, prm.requests)
-}
-
-type updateRequestMessage struct {
-	requestID  graphsync.RequestID
-	extensions []graphsync.ExtensionData
-	response   chan error
-}
-
-func (urm *updateRequestMessage) handle(rm *ResponseManager) {
-	err := rm.updateRequest(urm.requestID, urm.extensions)
-	select {
-	case <-rm.ctx.Done():
-	case urm.response <- err:
-	}
-}
-
 type pauseRequestMessage struct {
+	p         peer.ID
 	requestID graphsync.RequestID
 	response  chan error
 }
 
 func (prm *pauseRequestMessage) handle(rm *ResponseManager) {
-	err := rm.pauseRequest(prm.requestID)
+	err := rm.pauseRequest(prm.p, prm.requestID)
 	select {
 	case <-rm.ctx.Done():
 	case prm.response <- err:
@@ -47,13 +29,14 @@ func (prm *pauseRequestMessage) handle(rm *ResponseManager) {
 }
 
 type errorRequestMessage struct {
+	p         peer.ID
 	requestID graphsync.RequestID
 	err       error
 	response  chan error
 }
 
 func (erm *errorRequestMessage) handle(rm *ResponseManager) {
-	err := rm.abortRequest(rm.ctx, erm.requestID, erm.err)
+	err := rm.abortRequest(erm.p, erm.requestID, erm.err)
 	select {
 	case <-rm.ctx.Done():
 	case erm.response <- err:
@@ -72,13 +55,14 @@ func (sm *synchronizeMessage) handle(rm *ResponseManager) {
 }
 
 type unpauseRequestMessage struct {
+	p          peer.ID
 	requestID  graphsync.RequestID
 	response   chan error
 	extensions []graphsync.ExtensionData
 }
 
 func (urm *unpauseRequestMessage) handle(rm *ResponseManager) {
-	err := rm.unpauseRequest(urm.requestID, urm.extensions...)
+	err := rm.unpauseRequest(urm.p, urm.requestID, urm.extensions...)
 	select {
 	case <-rm.ctx.Done():
 	case urm.response <- err:
@@ -86,12 +70,12 @@ func (urm *unpauseRequestMessage) handle(rm *ResponseManager) {
 }
 
 type responseUpdateRequest struct {
-	requestID  graphsync.RequestID
+	key        responseKey
 	updateChan chan<- []gsmsg.GraphSyncRequest
 }
 
 func (rur *responseUpdateRequest) handle(rm *ResponseManager) {
-	updates := rm.getUpdates(rur.requestID)
+	updates := rm.getUpdates(rur.key)
 	select {
 	case <-rm.ctx.Done():
 	case rur.updateChan <- updates:
@@ -100,27 +84,20 @@ func (rur *responseUpdateRequest) handle(rm *ResponseManager) {
 
 type finishTaskRequest struct {
 	task *peertask.Task
-	p    peer.ID
 	err  error
-	done chan struct{}
 }
 
 func (ftr *finishTaskRequest) handle(rm *ResponseManager) {
-	rm.finishTask(ftr.task, ftr.p, ftr.err)
-	select {
-	case <-rm.ctx.Done():
-	case ftr.done <- struct{}{}:
-	}
+	rm.finishTask(ftr.task, ftr.err)
 }
 
 type startTaskRequest struct {
 	task         *peertask.Task
-	p            peer.ID
 	taskDataChan chan<- queryexecutor.ResponseTask
 }
 
 func (str *startTaskRequest) handle(rm *ResponseManager) {
-	taskData := rm.startTask(str.task, str.p)
+	taskData := rm.startTask(str.task)
 
 	select {
 	case <-rm.ctx.Done():
@@ -128,28 +105,6 @@ func (str *startTaskRequest) handle(rm *ResponseManager) {
 	}
 }
 
-type peerStateMessage struct {
-	p             peer.ID
-	peerStatsChan chan<- peerstate.PeerState
-}
-
-func (psm *peerStateMessage) handle(rm *ResponseManager) {
-	peerState := rm.peerState(psm.p)
-	select {
-	case psm.peerStatsChan <- peerState:
-	case <-rm.ctx.Done():
-	}
-}
-
-type terminateRequestMessage struct {
-	requestID graphsync.RequestID
-	done      chan<- struct{}
-}
-
-func (trm *terminateRequestMessage) handle(rm *ResponseManager) {
-	rm.terminateRequest(trm.requestID)
-	select {
-	case <-rm.ctx.Done():
-	case trm.done <- struct{}{}:
-	}
+func (prm *processRequestMessage) handle(rm *ResponseManager) {
+	rm.processRequests(prm.p, prm.requests)
 }

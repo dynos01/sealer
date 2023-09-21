@@ -5,10 +5,10 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/libp2p/go-libp2p/core/discovery"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer"
-	discimpl "github.com/libp2p/go-libp2p/p2p/discovery/backoff"
+	"github.com/libp2p/go-libp2p-core/discovery"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/peer"
+	discimpl "github.com/libp2p/go-libp2p-discovery"
 )
 
 var (
@@ -74,8 +74,7 @@ type discover struct {
 }
 
 // MinTopicSize returns a function that checks if a router is ready for publishing based on the topic size.
-// The router ultimately decides the whether it is ready or not, the given size is just a suggestion. Note
-// that the topic size does not include the router in the count.
+// The router ultimately decides the whether it is ready or not, the given size is just a suggestion.
 func MinTopicSize(size int) RouterReady {
 	return func(rt PubSubRouter, topic string) (bool, error) {
 		return rt.EnoughPeers(topic, size), nil

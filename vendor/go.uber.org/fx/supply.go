@@ -32,51 +32,27 @@ import (
 // they had been provided using a constructor that simply returns them.
 // The most specific type of each value (as determined by reflection) is used.
 //
-// This serves a purpose similar to what fx.Replace does for fx.Decorate.
-//
 // For example, given:
 //
-//	type (
-//		TypeA struct{}
-//		TypeB struct{}
-//		TypeC struct{}
-//	)
+//  type (
+//  	TypeA struct{}
+//  	TypeB struct{}
+//  	TypeC struct{}
+//  )
 //
-//	var a, b, c = &TypeA{}, TypeB{}, &TypeC{}
+//  var a, b, c = &TypeA{}, TypeB{}, &TypeC{}
 //
 // The following two forms are equivalent:
 //
-//	fx.Supply(a, b, fx.Annotated{Target: c})
+//  fx.Supply(a, b, fx.Annotated{Target: c})
 //
-//	fx.Provide(
-//		func() *TypeA { return a },
-//		func() TypeB { return b },
-//		fx.Annotated{Target: func() *TypeC { return c }},
-//	)
+//  fx.Provide(
+//  	func() *TypeA { return a },
+//  	func() TypeB { return b },
+//  	fx.Annotated{Target: func() *TypeC { return c }},
+//  )
 //
 // Supply panics if a value (or annotation target) is an untyped nil or an error.
-//
-// # Supply Caveats
-//
-// As mentioned above, Supply uses the most specific type of the provided
-// value. For interface values, this refers to the type of the implementation,
-// not the interface. So if you supply an http.Handler, fx.Supply will use the
-// type of the implementation.
-//
-//	var handler http.Handler = http.HandlerFunc(f)
-//	fx.Supply(handler)
-//
-// Is equivalent to,
-//
-//	fx.Provide(func() http.HandlerFunc { return f })
-//
-// This is typically NOT what you intended. To supply the handler above as an
-// http.Handler, we need to use the fx.Annotate function with the fx.As
-// annotation.
-//
-//	fx.Supply(
-//		fx.Annotate(handler, fx.As(new(http.Handler))),
-//	)
 func Supply(values ...interface{}) Option {
 	constructors := make([]interface{}, len(values)) // one function per value
 	types := make([]reflect.Type, len(values))
@@ -110,9 +86,9 @@ type supplyOption struct {
 	Stack   fxreflect.Stack
 }
 
-func (o supplyOption) apply(m *module) {
+func (o supplyOption) apply(app *App) {
 	for i, target := range o.Targets {
-		m.provides = append(m.provides, provide{
+		app.provides = append(app.provides, provide{
 			Target:     target,
 			Stack:      o.Stack,
 			IsSupply:   true,

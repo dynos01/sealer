@@ -1,2 +1,2 @@
-//go:generate goupnpdcpgen -dcp_name internetgateway1 -code_tmpl_file ../dcps.gotemplate
+//go:generate goupnpdcpgen -dcp_name internetgateway1
 package internetgateway1

@@ -134,7 +134,7 @@ func (nn *NavigableIPLDNode) ChildTotal() uint {
 // function.
 // TODO: Check for errors to avoid a panic?
 func ExtractIPLDNode(node NavigableNode) Node {
-	return node.GetIPLDNode()
+	return node.(*NavigableIPLDNode).GetIPLDNode()
 }
 
 // TODO: `Cleanup` is not supported at the moment in the `Walker`.

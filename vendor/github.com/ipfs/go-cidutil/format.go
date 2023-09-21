@@ -6,7 +6,6 @@ import (
 
 	c "github.com/ipfs/go-cid"
 	mb "github.com/multiformats/go-multibase"
-	mc "github.com/multiformats/go-multicodec"
 	mh "github.com/multiformats/go-multihash"
 )
 
@@ -129,7 +128,11 @@ func baseToString(base mb.Encoding) string {
 }
 
 func codecToString(num uint64) string {
-	return mc.Code(num).String()
+	name, ok := c.CodecToStr[num]
+	if !ok {
+		return fmt.Sprintf("codec?%d", num)
+	}
+	return name
 }
 
 func hashToString(num uint64) string {

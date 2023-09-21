@@ -5,12 +5,14 @@ import (
 	"io"
 	"sync"
 
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/transport"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
 
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/transport"
+
 	logging "github.com/ipfs/go-log/v2"
+	tptu "github.com/libp2p/go-libp2p-transport-upgrader"
 )
 
 var log = logging.Logger("p2p-circuit")
@@ -27,7 +29,7 @@ type Client struct {
 	ctx       context.Context
 	ctxCancel context.CancelFunc
 	host      host.Host
-	upgrader  transport.Upgrader
+	upgrader  *tptu.Upgrader
 
 	incoming chan accept
 
@@ -52,7 +54,7 @@ type completion struct {
 
 // New constructs a new p2p-circuit/v2 client, attached to the given host and using the given
 // upgrader to perform connection upgrades.
-func New(h host.Host, upgrader transport.Upgrader) (*Client, error) {
+func New(h host.Host, upgrader *tptu.Upgrader) (*Client, error) {
 	cl := &Client{
 		host:        h,
 		upgrader:    upgrader,
@@ -66,11 +68,13 @@ func New(h host.Host, upgrader transport.Upgrader) (*Client, error) {
 
 // Start registers the circuit (client) protocol stream handlers
 func (c *Client) Start() {
+	c.host.SetStreamHandler(proto.ProtoIDv1, c.handleStreamV1)
 	c.host.SetStreamHandler(proto.ProtoIDv2Stop, c.handleStreamV2)
 }
 
 func (c *Client) Close() error {
 	c.ctxCancel()
+	c.host.RemoveStreamHandler(proto.ProtoIDv1)
 	c.host.RemoveStreamHandler(proto.ProtoIDv2Stop)
 	return nil
 }

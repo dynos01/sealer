@@ -8,20 +8,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/peerstore"
-	"github.com/libp2p/go-libp2p/core/protocol"
-	"github.com/libp2p/go-libp2p/core/routing"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/network"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/peerstore"
+	"github.com/libp2p/go-libp2p-core/protocol"
+	"github.com/libp2p/go-libp2p-core/routing"
 
 	"github.com/libp2p/go-libp2p-kad-dht/internal"
 	dhtcfg "github.com/libp2p/go-libp2p-kad-dht/internal/config"
 	"github.com/libp2p/go-libp2p-kad-dht/internal/net"
 	"github.com/libp2p/go-libp2p-kad-dht/metrics"
-	"github.com/libp2p/go-libp2p-kad-dht/netsize"
 	pb "github.com/libp2p/go-libp2p-kad-dht/pb"
 	"github.com/libp2p/go-libp2p-kad-dht/providers"
 	"github.com/libp2p/go-libp2p-kad-dht/rtrefresh"
@@ -33,10 +30,11 @@ import (
 	"github.com/gogo/protobuf/proto"
 	ds "github.com/ipfs/go-datastore"
 	logging "github.com/ipfs/go-log"
+	"github.com/jbenet/goprocess"
+	goprocessctx "github.com/jbenet/goprocess/context"
 	"github.com/multiformats/go-base32"
 	ma "github.com/multiformats/go-multiaddr"
 	"go.opencensus.io/tag"
-	"go.uber.org/multierr"
 	"go.uber.org/zap"
 )
 
@@ -70,6 +68,11 @@ const (
 	protectedBuckets = 2
 )
 
+type addPeerRTReq struct {
+	p         peer.ID
+	queryPeer bool
+}
+
 // IpfsDHT is an implementation of Kademlia with S/Kademlia modifications.
 // It is used to implement the base Routing module.
 type IpfsDHT struct {
@@ -91,18 +94,20 @@ type IpfsDHT struct {
 
 	Validator record.Validator
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	ctx  context.Context
+	proc goprocess.Process
 
 	protoMessenger *pb.ProtocolMessenger
-	msgSender      pb.MessageSenderWithDisconnect
+	msgSender      pb.MessageSender
+
+	plk sync.Mutex
 
 	stripedPutLocks [256]sync.Mutex
 
 	// DHT protocols we query with. We'll only add peers to our routing
 	// table if they speak these protocols.
-	protocols []protocol.ID
+	protocols     []protocol.ID
+	protocolsStrs []string
 
 	// DHT protocols we can respond to.
 	serverProtocols []protocol.ID
@@ -121,12 +126,6 @@ type IpfsDHT struct {
 
 	autoRefresh bool
 
-	// timeout for the lookupCheck operation
-	lookupCheckTimeout time.Duration
-	// number of concurrent lookupCheck operations
-	lookupCheckCapacity int
-	lookupChecksLk      sync.Mutex
-
 	// A function returning a set of bootstrap peers to fallback on if all other attempts to fix
 	// the routing table fail (or, e.g., this is the first time this node is
 	// connecting to the network).
@@ -142,24 +141,13 @@ type IpfsDHT struct {
 	disableFixLowPeers bool
 	fixLowPeersChan    chan struct{}
 
-	addPeerToRTChan   chan peer.ID
+	addPeerToRTChan   chan addPeerRTReq
 	refreshFinishedCh chan struct{}
 
 	rtFreezeTimeout time.Duration
 
-	// network size estimator
-	nsEstimator   *netsize.Estimator
-	enableOptProv bool
-
-	// a bound channel to limit asynchronicity of in-flight ADD_PROVIDER RPCs
-	optProvJobsPool chan struct{}
-
 	// configuration variables for tests
 	testAddressUpdateProcessing bool
-
-	// addrFilter is used to filter the addresses we put into the peer store.
-	// Mostly used to filter out localhost and local addresses.
-	addrFilter func([]ma.Multiaddr) []ma.Multiaddr
 }
 
 // Assert that IPFS assumptions about interfaces aren't broken. These aren't a
@@ -189,7 +177,7 @@ func New(ctx context.Context, h host.Host, options ...Option) (*IpfsDHT, error) 
 		return nil, err
 	}
 
-	dht, err := makeDHT(h, cfg)
+	dht, err := makeDHT(ctx, h, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create DHT, err=%s", err)
 	}
@@ -227,27 +215,30 @@ func New(ctx context.Context, h host.Host, options ...Option) (*IpfsDHT, error) 
 	}
 
 	// register for event bus and network notifications
-	if err := dht.startNetworkSubscriber(); err != nil {
+	sn, err := newSubscriberNotifiee(dht)
+	if err != nil {
 		return nil, err
+	}
+	dht.proc.Go(sn.subscribe)
+	// handle providers
+	if mgr, ok := dht.providerStore.(interface{ Process() goprocess.Process }); ok {
+		dht.proc.AddChild(mgr.Process())
 	}
 
 	// go-routine to make sure we ALWAYS have RT peer addresses in the peerstore
 	// since RT membership is decoupled from connectivity
 	go dht.persistRTPeersInPeerStore()
 
-	dht.rtPeerLoop()
+	dht.proc.Go(dht.rtPeerLoop)
 
 	// Fill routing table with currently connected peers that are DHT servers
+	dht.plk.Lock()
 	for _, p := range dht.host.Network().Peers() {
-		dht.peerFound(p)
+		dht.peerFound(dht.ctx, p, false)
 	}
+	dht.plk.Unlock()
 
-	dht.rtRefreshManager.Start()
-
-	// listens to the fix low peers chan and tries to fix the Routing Table
-	if !dht.disableFixLowPeers {
-		dht.runFixLowPeersLoop()
-	}
+	dht.proc.Go(dht.populatePeers)
 
 	return dht, nil
 }
@@ -274,7 +265,7 @@ func NewDHTClient(ctx context.Context, h host.Host, dstore ds.Batching) *IpfsDHT
 	return dht
 }
 
-func makeDHT(h host.Host, cfg dhtcfg.Config) (*IpfsDHT, error) {
+func makeDHT(ctx context.Context, h host.Host, cfg dhtcfg.Config) (*IpfsDHT, error) {
 	var protocols, serverProtocols []protocol.ID
 
 	v1proto := cfg.ProtocolPrefix + kad1
@@ -294,23 +285,19 @@ func makeDHT(h host.Host, cfg dhtcfg.Config) (*IpfsDHT, error) {
 		host:                   h,
 		birth:                  time.Now(),
 		protocols:              protocols,
+		protocolsStrs:          protocol.ConvertToStrings(protocols),
 		serverProtocols:        serverProtocols,
 		bucketSize:             cfg.BucketSize,
 		alpha:                  cfg.Concurrency,
 		beta:                   cfg.Resiliency,
-		lookupCheckCapacity:    cfg.LookupCheckConcurrency,
 		queryPeerFilter:        cfg.QueryPeerFilter,
 		routingTablePeerFilter: cfg.RoutingTable.PeerFilter,
 		rtPeerDiversityFilter:  cfg.RoutingTable.DiversityFilter,
-		addrFilter:             cfg.AddressFilter,
 
 		fixLowPeersChan: make(chan struct{}, 1),
 
-		addPeerToRTChan:   make(chan peer.ID),
+		addPeerToRTChan:   make(chan addPeerRTReq),
 		refreshFinishedCh: make(chan struct{}),
-
-		enableOptProv:   cfg.EnableOptimisticProvide,
-		optProvJobsPool: nil,
 	}
 
 	var maxLastSuccessfulOutboundThreshold time.Duration
@@ -320,7 +307,7 @@ func makeDHT(h host.Host, cfg dhtcfg.Config) (*IpfsDHT, error) {
 	// To grok the Math Wizardy that produced these exact equations, please be patient as a document explaining it will
 	// be published soon.
 	if cfg.Concurrency < cfg.BucketSize { // (alpha < K)
-		l1 := math.Log(float64(1) / float64(cfg.BucketSize))                              // (Log(1/K))
+		l1 := math.Log(float64(1) / float64(cfg.BucketSize))                              //(Log(1/K))
 		l2 := math.Log(float64(1) - (float64(cfg.Concurrency) / float64(cfg.BucketSize))) // Log(1 - (alpha / K))
 		maxLastSuccessfulOutboundThreshold = time.Duration(l1 / l2 * float64(cfg.RoutingTable.RefreshInterval))
 	} else {
@@ -336,29 +323,27 @@ func makeDHT(h host.Host, cfg dhtcfg.Config) (*IpfsDHT, error) {
 	dht.routingTable = rt
 	dht.bootstrapPeers = cfg.BootstrapPeers
 
-	dht.lookupCheckTimeout = cfg.RoutingTable.RefreshQueryTimeout
-
-	// init network size estimator
-	dht.nsEstimator = netsize.NewEstimator(h.ID(), rt, cfg.BucketSize)
-
-	if dht.enableOptProv {
-		dht.optProvJobsPool = make(chan struct{}, cfg.OptimisticProvideJobsPoolSize)
-	}
-
 	// rt refresh manager
-	dht.rtRefreshManager, err = makeRtRefreshManager(dht, cfg, maxLastSuccessfulOutboundThreshold)
+	rtRefresh, err := makeRtRefreshManager(dht, cfg, maxLastSuccessfulOutboundThreshold)
 	if err != nil {
 		return nil, fmt.Errorf("failed to construct RT Refresh Manager,err=%s", err)
 	}
+	dht.rtRefreshManager = rtRefresh
+
+	// create a DHT proc with the given context
+	dht.proc = goprocessctx.WithContextAndTeardown(ctx, func() error {
+		return rtRefresh.Close()
+	})
 
 	// create a tagged context derived from the original context
+	ctxTags := dht.newContextWithLocalTags(ctx)
 	// the DHT context should be done when the process is closed
-	dht.ctx, dht.cancel = context.WithCancel(dht.newContextWithLocalTags(context.Background()))
+	dht.ctx = goprocessctx.WithProcessClosing(ctxTags, dht.proc)
 
 	if cfg.ProviderStore != nil {
 		dht.providerStore = cfg.ProviderStore
 	} else {
-		dht.providerStore, err = providers.NewProviderManager(h.ID(), dht.peerstore, cfg.Datastore)
+		dht.providerStore, err = providers.NewProviderManager(dht.ctx, h.ID(), dht.peerstore, cfg.Datastore)
 		if err != nil {
 			return nil, fmt.Errorf("initializing default provider manager (%v)", err)
 		}
@@ -367,18 +352,6 @@ func makeDHT(h host.Host, cfg dhtcfg.Config) (*IpfsDHT, error) {
 	dht.rtFreezeTimeout = rtFreezeTimeout
 
 	return dht, nil
-}
-
-// lookupCheck performs a lookup request to a remote peer.ID, verifying that it is able to
-// answer it correctly
-func (dht *IpfsDHT) lookupCheck(ctx context.Context, p peer.ID) error {
-	// lookup request to p requesting for its own peer.ID
-	peerids, err := dht.protoMessenger.GetClosestPeers(ctx, p, p)
-	// p should return at least its own peerid
-	if err == nil && len(peerids) == 0 {
-		return fmt.Errorf("peer %s failed to return its closest peers, got %d", p, len(peerids))
-	}
-	return err
 }
 
 func makeRtRefreshManager(dht *IpfsDHT, cfg dhtcfg.Config, maxLastSuccessfulOutboundThreshold time.Duration) (*rtrefresh.RtRefreshManager, error) {
@@ -396,7 +369,6 @@ func makeRtRefreshManager(dht *IpfsDHT, cfg dhtcfg.Config, maxLastSuccessfulOutb
 		dht.host, dht.routingTable, cfg.RoutingTable.AutoRefresh,
 		keyGenFnc,
 		queryFnc,
-		dht.lookupCheck,
 		cfg.RoutingTable.RefreshQueryTimeout,
 		cfg.RoutingTable.RefreshInterval,
 		maxLastSuccessfulOutboundThreshold,
@@ -461,32 +433,42 @@ func (dht *IpfsDHT) Mode() ModeOpt {
 	return dht.auto
 }
 
-// runFixLowPeersLoop manages simultaneous requests to fixLowPeers
-func (dht *IpfsDHT) runFixLowPeersLoop() {
-	dht.wg.Add(1)
-	go func() {
-		defer dht.wg.Done()
+func (dht *IpfsDHT) populatePeers(_ goprocess.Process) {
+	if !dht.disableFixLowPeers {
+		dht.fixLowPeers(dht.ctx)
+	}
 
-		dht.fixLowPeers()
+	if err := dht.rtRefreshManager.Start(); err != nil {
+		logger.Error(err)
+	}
 
-		ticker := time.NewTicker(periodicBootstrapInterval)
-		defer ticker.Stop()
+	// listens to the fix low peers chan and tries to fix the Routing Table
+	if !dht.disableFixLowPeers {
+		dht.proc.Go(dht.fixLowPeersRoutine)
+	}
 
-		for {
-			select {
-			case <-dht.fixLowPeersChan:
-			case <-ticker.C:
-			case <-dht.ctx.Done():
-				return
-			}
+}
 
-			dht.fixLowPeers()
+// fixLowPeersRouting manages simultaneous requests to fixLowPeers
+func (dht *IpfsDHT) fixLowPeersRoutine(proc goprocess.Process) {
+	ticker := time.NewTicker(periodicBootstrapInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-dht.fixLowPeersChan:
+		case <-ticker.C:
+		case <-proc.Closing():
+			return
 		}
-	}()
+
+		dht.fixLowPeers(dht.Context())
+	}
+
 }
 
 // fixLowPeers tries to get more peers into the routing table if we're below the threshold
-func (dht *IpfsDHT) fixLowPeers() {
+func (dht *IpfsDHT) fixLowPeers(ctx context.Context) {
 	if dht.routingTable.Size() > minRTRefreshThreshold {
 		return
 	}
@@ -494,7 +476,7 @@ func (dht *IpfsDHT) fixLowPeers() {
 	// we try to add all peers we are connected to to the Routing Table
 	// in case they aren't already there.
 	for _, p := range dht.host.Network().Peers() {
-		dht.peerFound(p)
+		dht.peerFound(ctx, p, false)
 	}
 
 	// TODO Active Bootstrapping
@@ -511,7 +493,7 @@ func (dht *IpfsDHT) fixLowPeers() {
 		found := 0
 		for _, i := range rand.Perm(len(bootstrapPeers)) {
 			ai := bootstrapPeers[i]
-			err := dht.Host().Connect(dht.ctx, ai)
+			err := dht.Host().Connect(ctx, ai)
 			if err == nil {
 				found++
 			} else {
@@ -596,123 +578,81 @@ func (dht *IpfsDHT) putLocal(ctx context.Context, key string, rec *recpb.Record)
 	return dht.datastore.Put(ctx, mkDsKey(key), data)
 }
 
-func (dht *IpfsDHT) rtPeerLoop() {
-	dht.wg.Add(1)
-	go func() {
-		defer dht.wg.Done()
+func (dht *IpfsDHT) rtPeerLoop(proc goprocess.Process) {
+	bootstrapCount := 0
+	isBootsrapping := false
+	var timerCh <-chan time.Time
 
-		var bootstrapCount uint
-		var isBootsrapping bool
-		var timerCh <-chan time.Time
-
-		for {
-			select {
-			case <-timerCh:
-				dht.routingTable.MarkAllPeersIrreplaceable()
-			case p := <-dht.addPeerToRTChan:
-				if dht.routingTable.Size() == 0 {
-					isBootsrapping = true
-					bootstrapCount = 0
-					timerCh = nil
-				}
-				// queryPeer set to true as we only try to add queried peers to the RT
-				newlyAdded, err := dht.routingTable.TryAddPeer(p, true, isBootsrapping)
-				if err != nil {
-					// peer not added.
-					continue
-				}
-				if newlyAdded {
-					// peer was added to the RT, it can now be fixed if needed.
-					dht.fixRTIfNeeded()
-				} else {
-					// the peer is already in our RT, but we just successfully queried it and so let's give it a
-					// bump on the query time so we don't ping it too soon for a liveliness check.
-					dht.routingTable.UpdateLastSuccessfulOutboundQueryAt(p, time.Now())
-				}
-			case <-dht.refreshFinishedCh:
-				bootstrapCount = bootstrapCount + 1
-				if bootstrapCount == 2 {
-					timerCh = time.NewTimer(dht.rtFreezeTimeout).C
-				}
-
-				old := isBootsrapping
-				isBootsrapping = false
-				if old {
-					dht.rtRefreshManager.RefreshNoWait()
-				}
-
-			case <-dht.ctx.Done():
-				return
+	for {
+		select {
+		case <-timerCh:
+			dht.routingTable.MarkAllPeersIrreplaceable()
+		case addReq := <-dht.addPeerToRTChan:
+			prevSize := dht.routingTable.Size()
+			if prevSize == 0 {
+				isBootsrapping = true
+				bootstrapCount = 0
+				timerCh = nil
 			}
+			newlyAdded, err := dht.routingTable.TryAddPeer(addReq.p, addReq.queryPeer, isBootsrapping)
+			if err != nil {
+				// peer not added.
+				continue
+			}
+			if !newlyAdded && addReq.queryPeer {
+				// the peer is already in our RT, but we just successfully queried it and so let's give it a
+				// bump on the query time so we don't ping it too soon for a liveliness check.
+				dht.routingTable.UpdateLastSuccessfulOutboundQueryAt(addReq.p, time.Now())
+			}
+		case <-dht.refreshFinishedCh:
+			bootstrapCount = bootstrapCount + 1
+			if bootstrapCount == 2 {
+				timerCh = time.NewTimer(dht.rtFreezeTimeout).C
+			}
+
+			old := isBootsrapping
+			isBootsrapping = false
+			if old {
+				dht.rtRefreshManager.RefreshNoWait()
+			}
+
+		case <-proc.Closing():
+			return
 		}
-	}()
+	}
 }
 
-// peerFound verifies whether the found peer advertises DHT protocols
-// and probe it to make sure it answers DHT queries as expected. If
-// it fails to answer, it isn't added to the routingTable.
-func (dht *IpfsDHT) peerFound(p peer.ID) {
-	// if the peer is already in the routing table or the appropriate bucket is
-	// already full, don't try to add the new peer.ID
-	if !dht.routingTable.UsefulNewPeer(p) {
-		return
+// peerFound signals the routingTable that we've found a peer that
+// might support the DHT protocol.
+// If we have a connection a peer but no exchange of a query RPC ->
+//    LastQueriedAt=time.Now (so we don't ping it for some time for a liveliness check)
+//    LastUsefulAt=0
+// If we connect to a peer and then exchange a query RPC ->
+//    LastQueriedAt=time.Now (same reason as above)
+//    LastUsefulAt=time.Now (so we give it some life in the RT without immediately evicting it)
+// If we query a peer we already have in our Routing Table ->
+//    LastQueriedAt=time.Now()
+//    LastUsefulAt remains unchanged
+// If we connect to a peer we already have in the RT but do not exchange a query (rare)
+//    Do Nothing.
+func (dht *IpfsDHT) peerFound(ctx context.Context, p peer.ID, queryPeer bool) {
+	if c := baseLogger.Check(zap.DebugLevel, "peer found"); c != nil {
+		c.Write(zap.String("peer", p.String()))
 	}
-
-	// verify whether the remote peer advertises the right dht protocol
 	b, err := dht.validRTPeer(p)
 	if err != nil {
 		logger.Errorw("failed to validate if peer is a DHT peer", "peer", p, "error", err)
 	} else if b {
-
-		// check if the maximal number of concurrent lookup checks is reached
-		dht.lookupChecksLk.Lock()
-		if dht.lookupCheckCapacity == 0 {
-			dht.lookupChecksLk.Unlock()
-			// drop the new peer.ID if the maximal number of concurrent lookup
-			// checks is reached
+		select {
+		case dht.addPeerToRTChan <- addPeerRTReq{p, queryPeer}:
+		case <-dht.ctx.Done():
 			return
 		}
-		dht.lookupCheckCapacity--
-		dht.lookupChecksLk.Unlock()
-
-		go func() {
-			livelinessCtx, cancel := context.WithTimeout(dht.ctx, dht.lookupCheckTimeout)
-			defer cancel()
-
-			// performing a FIND_NODE query
-			err := dht.lookupCheck(livelinessCtx, p)
-
-			dht.lookupChecksLk.Lock()
-			dht.lookupCheckCapacity++
-			dht.lookupChecksLk.Unlock()
-
-			if err != nil {
-				logger.Debugw("connected peer not answering DHT request as expected", "peer", p, "error", err)
-				return
-			}
-
-			// if the FIND_NODE succeeded, the peer is considered as valid
-			dht.validPeerFound(p)
-		}()
-	}
-}
-
-// validPeerFound signals the routingTable that we've found a peer that
-// supports the DHT protocol, and just answered correctly to a DHT FindPeers
-func (dht *IpfsDHT) validPeerFound(p peer.ID) {
-	if c := baseLogger.Check(zap.DebugLevel, "peer found"); c != nil {
-		c.Write(zap.String("peer", p.String()))
-	}
-
-	select {
-	case dht.addPeerToRTChan <- p:
-	case <-dht.ctx.Done():
-		return
 	}
 }
 
 // peerStoppedDHT signals the routing table that a peer is unable to responsd to DHT queries anymore.
-func (dht *IpfsDHT) peerStoppedDHT(p peer.ID) {
+func (dht *IpfsDHT) peerStoppedDHT(ctx context.Context, p peer.ID) {
 	logger.Debugw("peer stopped dht", "peer", p)
 	// A peer that does not support the DHT protocol is dead for us.
 	// There's no point in talking to anymore till it starts supporting the DHT protocol again.
@@ -727,10 +667,7 @@ func (dht *IpfsDHT) fixRTIfNeeded() {
 }
 
 // FindLocal looks for a peer with a given ID connected to this dht and returns the peer and the table it was found in.
-func (dht *IpfsDHT) FindLocal(ctx context.Context, id peer.ID) peer.AddrInfo {
-	_, span := internal.StartSpan(ctx, "IpfsDHT.FindLocal", trace.WithAttributes(attribute.Stringer("PeerID", id)))
-	defer span.End()
-
+func (dht *IpfsDHT) FindLocal(id peer.ID) peer.AddrInfo {
 	switch dht.host.Network().Connectedness(id) {
 	case network.Connected, network.CanConnect:
 		return dht.peerstore.PeerInfo(id)
@@ -843,6 +780,11 @@ func (dht *IpfsDHT) Context() context.Context {
 	return dht.ctx
 }
 
+// Process returns the DHT's process.
+func (dht *IpfsDHT) Process() goprocess.Process {
+	return dht.proc
+}
+
 // RoutingTable returns the DHT's routingTable.
 func (dht *IpfsDHT) RoutingTable() *kb.RoutingTable {
 	return dht.routingTable
@@ -850,25 +792,7 @@ func (dht *IpfsDHT) RoutingTable() *kb.RoutingTable {
 
 // Close calls Process Close.
 func (dht *IpfsDHT) Close() error {
-	dht.cancel()
-	dht.wg.Wait()
-
-	var wg sync.WaitGroup
-	closes := [...]func() error{
-		dht.rtRefreshManager.Close,
-		dht.providerStore.Close,
-	}
-	var errors [len(closes)]error
-	wg.Add(len(errors))
-	for i, c := range closes {
-		go func(i int, c func() error) {
-			defer wg.Done()
-			errors[i] = c()
-		}(i, c)
-	}
-	wg.Wait()
-
-	return multierr.Combine(errors[:]...)
+	return dht.proc.Close()
 }
 
 func mkDsKey(s string) ds.Key {
@@ -892,16 +816,7 @@ func (dht *IpfsDHT) Host() host.Host {
 
 // Ping sends a ping message to the passed peer and waits for a response.
 func (dht *IpfsDHT) Ping(ctx context.Context, p peer.ID) error {
-	ctx, span := internal.StartSpan(ctx, "IpfsDHT.Ping", trace.WithAttributes(attribute.Stringer("PeerID", p)))
-	defer span.End()
 	return dht.protoMessenger.Ping(ctx, p)
-}
-
-// NetworkSize returns the most recent estimation of the DHT network size.
-// EXPERIMENTAL: We do not provide any guarantees that this method will
-// continue to exist in the codebase. Use it at your own risk.
-func (dht *IpfsDHT) NetworkSize() (int32, error) {
-	return dht.nsEstimator.NetworkSize()
 }
 
 // newContextWithLocalTags returns a new context.Context with the InstanceID and
@@ -910,7 +825,7 @@ func (dht *IpfsDHT) NetworkSize() (int32, error) {
 func (dht *IpfsDHT) newContextWithLocalTags(ctx context.Context, extraTags ...tag.Mutator) context.Context {
 	extraTags = append(
 		extraTags,
-		tag.Upsert(metrics.KeyPeerID, dht.self.String()),
+		tag.Upsert(metrics.KeyPeerID, dht.self.Pretty()),
 		tag.Upsert(metrics.KeyInstanceID, fmt.Sprintf("%p", dht)),
 	)
 	ctx, _ = tag.New(
@@ -924,9 +839,6 @@ func (dht *IpfsDHT) maybeAddAddrs(p peer.ID, addrs []ma.Multiaddr, ttl time.Dura
 	// Don't add addresses for self or our connected peers. We have better ones.
 	if p == dht.self || dht.host.Network().Connectedness(p) == network.Connected {
 		return
-	}
-	if dht.addrFilter != nil {
-		addrs = dht.addrFilter(addrs)
 	}
 	dht.peerstore.AddAddrs(p, addrs, ttl)
 }

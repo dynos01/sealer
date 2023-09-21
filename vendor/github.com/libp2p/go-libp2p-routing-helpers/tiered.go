@@ -4,12 +4,13 @@ import (
 	"context"
 	"io"
 
-	"github.com/hashicorp/go-multierror"
-	"github.com/ipfs/go-cid"
+	ci "github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/routing"
+
+	multierror "github.com/hashicorp/go-multierror"
+	cid "github.com/ipfs/go-cid"
 	record "github.com/libp2p/go-libp2p-record"
-	ci "github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/routing"
 )
 
 // Tiered is like the Parallel except that GetValue and FindPeer
@@ -65,7 +66,7 @@ func (r Tiered) GetValue(ctx context.Context, key string, opts ...routing.Option
 // returning results in monotonically increasing "freshness" from all
 // sub-routers.
 func (r Tiered) SearchValue(ctx context.Context, key string, opts ...routing.Option) (<-chan []byte, error) {
-	return Parallel(r).SearchValue(ctx, key, opts...)
+	return Parallel{Routers: r.Routers, Validator: r.Validator}.SearchValue(ctx, key, opts...)
 }
 
 // GetPublicKey sequentially searches each sub-router for the the public key,

@@ -1,15 +1,11 @@
 export GOBIN ?= $(shell pwd)/bin
 
-GOLINT = $(GOBIN)/golint
-STATICCHECK = $(GOBIN)/staticcheck
-
 BENCH_FLAGS ?= -cpuprofile=cpu.pprof -memprofile=mem.pprof -benchmem
+GOLINT = $(GOBIN)/golint
 
-GO_FILES = $(shell \
+GO_FILES := $(shell \
 	find . '(' -path '*/.*' -o -path './vendor' ')' -prune \
 	-o -name '*.go' -print | cut -b3-)
-
-MODULES = . ./tools
 
 .PHONY: all
 all: build lint test
@@ -18,15 +14,8 @@ all: build lint test
 build:
 	go build ./...
 
-.PHONY: install
-install:
-	$(foreach dir,$(MODULES),( \
-		cd $(dir) && \
-		go mod download) && \
-	) true
-
 .PHONY: lint
-lint: $(GOLINT) $(STATICCHECK)
+lint: $(GOLINT)
 	@rm -rf lint.log
 	@echo "Checking formatting..."
 	@gofmt -d -s $(GO_FILES) 2>&1 | tee lint.log
@@ -34,19 +23,14 @@ lint: $(GOLINT) $(STATICCHECK)
 	@go vet ./... 2>&1 | tee -a lint.log
 	@echo "Checking lint..."
 	@$(GOLINT) ./... 2>&1 | tee -a lint.log
-	@echo "Checking staticcheck..."
-	@$(STATICCHECK) ./... 2>&1 | tee -a lint.log
 	@echo "Checking for unresolved FIXMEs..."
 	@git grep -i fixme | grep -v -e Makefile | tee -a lint.log
 	@echo "Checking for license headers..."
 	@./check_license.sh | tee -a lint.log
 	@[ ! -s lint.log ]
 
-$(GOLINT): tools/go.mod
-	cd tools && go install golang.org/x/lint/golint
-
-$(STATICCHECK): tools/go.mod
-	cd tools && go install honnef.co/go/tools/cmd/staticcheck
+$(GOLINT):
+	go install golang.org/x/lint/golint
 
 .PHONY: test
 test:
@@ -61,7 +45,3 @@ cover:
 BENCH ?= .
 bench:
 	go list ./... | xargs -n1 go test -bench=$(BENCH) -run="^$$" $(BENCH_FLAGS)
-
-.PHONY: tidy
-tidy:
-	$(foreach dir,$(MODULES),(cd $(dir) && go mod tidy) &&) true

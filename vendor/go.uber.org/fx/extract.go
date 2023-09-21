@@ -33,7 +33,8 @@ var _typeOfIn = reflect.TypeOf(In{})
 // container on application initialization. The target MUST be a pointer to a
 // struct. Only exported fields will be filled.
 //
-// Deprecated: Use Populate instead.
+// Extract will be deprecated soon: use Populate instead, which doesn't
+// require defining a container struct.
 func Extract(target interface{}) Option {
 	v := reflect.ValueOf(target)
 

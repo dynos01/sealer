@@ -14,18 +14,18 @@ import (
 
 	b64 "encoding/base64"
 
-	icore "github.com/ipfs/boxo/coreiface"
-	icorepath "github.com/ipfs/boxo/coreiface/path"
-	"github.com/ipfs/boxo/files"
-	"github.com/libp2p/go-libp2p/core/peer"
+	config "github.com/ipfs/go-ipfs-config"
+	files "github.com/ipfs/go-ipfs-files"
+	icore "github.com/ipfs/interface-go-ipfs-core"
+	icorepath "github.com/ipfs/interface-go-ipfs-core/path"
 	ma "github.com/multiformats/go-multiaddr"
 
-	"github.com/ipfs/kubo/config"
-	"github.com/ipfs/kubo/core"
-	"github.com/ipfs/kubo/core/coreapi"
-	"github.com/ipfs/kubo/core/node/libp2p"
-	"github.com/ipfs/kubo/plugin/loader"
-	"github.com/ipfs/kubo/repo/fsrepo"
+	"github.com/ipfs/go-ipfs/core"
+	"github.com/ipfs/go-ipfs/core/coreapi"
+	"github.com/ipfs/go-ipfs/core/node/libp2p"
+	"github.com/ipfs/go-ipfs/plugin/loader"
+	"github.com/ipfs/go-ipfs/repo/fsrepo"
+	"github.com/libp2p/go-libp2p-core/peer"
 )
 
 var stageNow int

@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/transport"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/transport"
 
+	tptu "github.com/libp2p/go-libp2p-transport-upgrader"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -18,7 +18,7 @@ var circuitAddr = ma.Cast(circuitProtocol.VCode)
 
 // AddTransport constructs a new p2p-circuit/v2 client and adds it as a transport to the
 // host network
-func AddTransport(h host.Host, upgrader transport.Upgrader) error {
+func AddTransport(h host.Host, upgrader *tptu.Upgrader) error {
 	n, ok := h.Network().(transport.TransportNetwork)
 	if !ok {
 		return fmt.Errorf("%v is not a transport network", h.Network())
@@ -49,32 +49,14 @@ var _ transport.Transport = (*Client)(nil)
 var _ io.Closer = (*Client)(nil)
 
 func (c *Client) Dial(ctx context.Context, a ma.Multiaddr, p peer.ID) (transport.CapableConn, error) {
-	connScope, err := c.host.Network().ResourceManager().OpenConnection(network.DirOutbound, false, a)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := c.dialAndUpgrade(ctx, a, p, connScope)
-	if err != nil {
-		connScope.Done()
-		return nil, err
-	}
-	return conn, nil
-}
-
-func (c *Client) dialAndUpgrade(ctx context.Context, a ma.Multiaddr, p peer.ID, connScope network.ConnManagementScope) (transport.CapableConn, error) {
-	if err := connScope.SetPeer(p); err != nil {
-		return nil, err
-	}
 	conn, err := c.dial(ctx, a, p)
 	if err != nil {
 		return nil, err
 	}
+
 	conn.tagHop()
-	cc, err := c.upgrader.Upgrade(ctx, c, conn, network.DirOutbound, p, connScope)
-	if err != nil {
-		return nil, err
-	}
-	return capableConn{cc.(capableConnWithStat)}, nil
+
+	return c.upgrader.UpgradeOutbound(ctx, c, conn, p)
 }
 
 func (c *Client) CanDial(addr ma.Multiaddr) bool {

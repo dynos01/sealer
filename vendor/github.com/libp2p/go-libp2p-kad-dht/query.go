@@ -8,15 +8,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
-	pstore "github.com/libp2p/go-libp2p/core/peerstore"
-	"github.com/libp2p/go-libp2p/core/routing"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
+	"github.com/libp2p/go-libp2p-core/network"
+	"github.com/libp2p/go-libp2p-core/peer"
+	pstore "github.com/libp2p/go-libp2p-core/peerstore"
+	"github.com/libp2p/go-libp2p-core/routing"
 
 	"github.com/google/uuid"
-	"github.com/libp2p/go-libp2p-kad-dht/internal"
 	"github.com/libp2p/go-libp2p-kad-dht/qpeerset"
 	kb "github.com/libp2p/go-libp2p-kbucket"
 )
@@ -25,7 +22,7 @@ import (
 var ErrNoPeersQueried = errors.New("failed to query any peers")
 
 type queryFn func(context.Context, peer.ID) ([]*peer.AddrInfo, error)
-type stopFn func(*qpeerset.QueryPeerset) bool
+type stopFn func() bool
 
 // query represents a single DHT query.
 type query struct {
@@ -64,9 +61,8 @@ type query struct {
 }
 
 type lookupWithFollowupResult struct {
-	peers   []peer.ID            // the top K not unreachable peers at the end of the query
-	state   []qpeerset.PeerState // the peer states at the end of the query of the peers slice (not closest)
-	closest []peer.ID            // the top K peers at the end of the query
+	peers []peer.ID            // the top K not unreachable peers at the end of the query
+	state []qpeerset.PeerState // the peer states at the end of the query
 
 	// indicates that neither the lookup nor the followup has been prematurely terminated by an external condition such
 	// as context cancellation or the stop function being called.
@@ -81,11 +77,8 @@ type lookupWithFollowupResult struct {
 // After the lookup is complete the query function is run (unless stopped) against all of the top K peers from the
 // lookup that have not already been successfully queried.
 func (dht *IpfsDHT) runLookupWithFollowup(ctx context.Context, target string, queryFn queryFn, stopFn stopFn) (*lookupWithFollowupResult, error) {
-	ctx, span := internal.StartSpan(ctx, "IpfsDHT.RunLookupWithFollowup", trace.WithAttributes(internal.KeyAsAttribute("Target", target)))
-	defer span.End()
-
 	// run the query
-	lookupRes, qps, err := dht.runQuery(ctx, target, queryFn, stopFn)
+	lookupRes, err := dht.runQuery(ctx, target, queryFn, stopFn)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +99,7 @@ func (dht *IpfsDHT) runLookupWithFollowup(ctx context.Context, target string, qu
 	}
 
 	// return if the lookup has been externally stopped
-	if ctx.Err() != nil || stopFn(qps) {
+	if ctx.Err() != nil || stopFn() {
 		lookupRes.completed = false
 		return lookupRes, nil
 	}
@@ -129,7 +122,7 @@ processFollowUp:
 		select {
 		case <-doneCh:
 			followupsCompleted++
-			if stopFn(qps) {
+			if stopFn() {
 				cancelFollowUp()
 				if i < len(queryPeers)-1 {
 					lookupRes.completed = false
@@ -152,10 +145,7 @@ processFollowUp:
 	return lookupRes, nil
 }
 
-func (dht *IpfsDHT) runQuery(ctx context.Context, target string, queryFn queryFn, stopFn stopFn) (*lookupWithFollowupResult, *qpeerset.QueryPeerset, error) {
-	ctx, span := internal.StartSpan(ctx, "IpfsDHT.RunQuery")
-	defer span.End()
-
+func (dht *IpfsDHT) runQuery(ctx context.Context, target string, queryFn queryFn, stopFn stopFn) (*lookupWithFollowupResult, error) {
 	// pick the K closest peers to the key in our Routing table.
 	targetKadID := kb.ConvertKey(target)
 	seedPeers := dht.routingTable.NearestPeers(targetKadID, dht.bucketSize)
@@ -164,7 +154,7 @@ func (dht *IpfsDHT) runQuery(ctx context.Context, target string, queryFn queryFn
 			Type:  routing.QueryError,
 			Extra: kb.ErrLookupFailure.Error(),
 		})
-		return nil, nil, kb.ErrLookupFailure
+		return nil, kb.ErrLookupFailure
 	}
 
 	q := &query{
@@ -188,7 +178,7 @@ func (dht *IpfsDHT) runQuery(ctx context.Context, target string, queryFn queryFn
 	}
 
 	res := q.constructLookupResult(targetKadID)
-	return res, q.queryPeers, nil
+	return res, nil
 }
 
 func (q *query) recordPeerIsValuable(p peer.ID) {
@@ -245,14 +235,11 @@ func (q *query) constructLookupResult(target kb.ID) *lookupWithFollowupResult {
 		sortedPeers = sortedPeers[:q.dht.bucketSize]
 	}
 
-	closest := q.queryPeers.GetClosestNInStates(q.dht.bucketSize, qpeerset.PeerHeard, qpeerset.PeerWaiting, qpeerset.PeerQueried, qpeerset.PeerUnreachable)
-
 	// return the top K not unreachable peers as well as their states at the end of the query
 	res := &lookupWithFollowupResult{
 		peers:     sortedPeers,
 		state:     make([]qpeerset.PeerState, len(sortedPeers)),
 		completed: completed,
-		closest:   closest,
 	}
 
 	for i, p := range sortedPeers {
@@ -272,10 +259,7 @@ type queryUpdate struct {
 }
 
 func (q *query) run() {
-	ctx, span := internal.StartSpan(q.ctx, "IpfsDHT.Query.Run")
-	defer span.End()
-
-	pathCtx, cancelPath := context.WithCancel(ctx)
+	pathCtx, cancelPath := context.WithCancel(q.ctx)
 	defer cancelPath()
 
 	alpha := q.dht.alpha
@@ -319,12 +303,6 @@ func (q *query) run() {
 
 // spawnQuery starts one query, if an available heard peer is found
 func (q *query) spawnQuery(ctx context.Context, cause peer.ID, queryPeer peer.ID, ch chan<- *queryUpdate) {
-	ctx, span := internal.StartSpan(ctx, "IpfsDHT.SpawnQuery", trace.WithAttributes(
-		attribute.String("Cause", cause.String()),
-		attribute.String("QueryPeer", queryPeer.String()),
-	))
-	defer span.End()
-
 	PublishLookupEvent(ctx,
 		NewLookupEvent(
 			q.dht.self,
@@ -349,7 +327,7 @@ func (q *query) spawnQuery(ctx context.Context, cause peer.ID, queryPeer peer.ID
 
 func (q *query) isReadyToTerminate(ctx context.Context, nPeersToQuery int) (bool, LookupTerminationReason, []peer.ID) {
 	// give the application logic a chance to terminate
-	if q.stopFn(q.queryPeers) {
+	if q.stopFn() {
 		return true, LookupStopped, nil
 	}
 	if q.isStarvationTermination() {
@@ -391,9 +369,6 @@ func (q *query) isStarvationTermination() bool {
 }
 
 func (q *query) terminate(ctx context.Context, cancel context.CancelFunc, reason LookupTerminationReason) {
-	ctx, span := internal.StartSpan(ctx, "IpfsDHT.Query.Terminate", trace.WithAttributes(attribute.Stringer("Reason", reason)))
-	defer span.End()
-
 	if q.terminated {
 		return
 	}
@@ -416,17 +391,13 @@ func (q *query) terminate(ctx context.Context, cancel context.CancelFunc, reason
 // queryPeer does not access the query state in queryPeers!
 func (q *query) queryPeer(ctx context.Context, ch chan<- *queryUpdate, p peer.ID) {
 	defer q.waitGroup.Done()
-
-	ctx, span := internal.StartSpan(ctx, "IpfsDHT.QueryPeer")
-	defer span.End()
-
 	dialCtx, queryCtx := ctx, ctx
 
 	// dial the peer
 	if err := q.dht.dialPeer(dialCtx, p); err != nil {
 		// remove the peer if there was a dial failure..but not because of a context cancellation
 		if dialCtx.Err() == nil {
-			q.dht.peerStoppedDHT(p)
+			q.dht.peerStoppedDHT(q.dht.ctx, p)
 		}
 		ch <- &queryUpdate{cause: p, unreachable: []peer.ID{p}}
 		return
@@ -437,7 +408,7 @@ func (q *query) queryPeer(ctx context.Context, ch chan<- *queryUpdate, p peer.ID
 	newPeers, err := q.queryFn(queryCtx, p)
 	if err != nil {
 		if queryCtx.Err() == nil {
-			q.dht.peerStoppedDHT(p)
+			q.dht.peerStoppedDHT(q.dht.ctx, p)
 		}
 		ch <- &queryUpdate{cause: p, unreachable: []peer.ID{p}}
 		return
@@ -446,7 +417,7 @@ func (q *query) queryPeer(ctx context.Context, ch chan<- *queryUpdate, p peer.ID
 	queryDuration := time.Since(startQuery)
 
 	// query successful, try to add to RT
-	q.dht.validPeerFound(p)
+	q.dht.peerFound(q.dht.ctx, p, true)
 
 	// process new peers
 	saw := []peer.ID{}
@@ -526,9 +497,6 @@ func (q *query) updateState(ctx context.Context, up *queryUpdate) {
 }
 
 func (dht *IpfsDHT) dialPeer(ctx context.Context, p peer.ID) error {
-	ctx, span := internal.StartSpan(ctx, "IpfsDHT.DialPeer", trace.WithAttributes(attribute.String("PeerID", p.String())))
-	defer span.End()
-
 	// short-circuit if we're already connected.
 	if dht.host.Network().Connectedness(p) == network.Connected {
 		return nil

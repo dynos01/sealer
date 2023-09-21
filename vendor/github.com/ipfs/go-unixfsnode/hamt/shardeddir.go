@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	bitfield "github.com/ipfs/go-bitfield"
+	"github.com/Stebalien/go-bitfield"
 	"github.com/ipfs/go-unixfsnode/data"
 	"github.com/ipfs/go-unixfsnode/iter"
 	dagpb "github.com/ipld/go-codec-dagpb"
@@ -42,10 +42,7 @@ func NewUnixFSHAMTShard(ctx context.Context, substrate dagpb.PBNode, data data.U
 		return nil, err
 	}
 	shardCache := make(map[ipld.Link]*_UnixFSHAMTShard, substrate.FieldLinks().Length())
-	bf, err := bitField(data)
-	if err != nil {
-		return nil, err
-	}
+	bf := bitField(data)
 	return &_UnixFSHAMTShard{
 		ctx:          ctx,
 		_substrate:   substrate,
@@ -55,25 +52,6 @@ func NewUnixFSHAMTShard(ctx context.Context, substrate dagpb.PBNode, data data.U
 		bitfield:     bf,
 		cachedLength: -1,
 	}, nil
-}
-
-// NewUnixFSHAMTShardWithPreload attempts to construct a UnixFSHAMTShard node from the base protobuf node plus
-// a decoded UnixFSData structure, and then iterate through and load the full set of hamt shards.
-func NewUnixFSHAMTShardWithPreload(ctx context.Context, substrate dagpb.PBNode, data data.UnixFSData, lsys *ipld.LinkSystem) (ipld.Node, error) {
-	n, err := NewUnixFSHAMTShard(ctx, substrate, data, lsys)
-	if err != nil {
-		return n, err
-	}
-
-	traverse, err := n.(*_UnixFSHAMTShard).length()
-	if traverse == -1 {
-		return n, fmt.Errorf("could not fully explore hamt during preload")
-	}
-	if err != nil {
-		return n, err
-	}
-
-	return n, nil
 }
 
 func (n UnixFSHAMTShard) Substrate() ipld.Node {
@@ -199,52 +177,46 @@ type _UnixFSShardedDir__ListItr struct {
 	total      int64
 }
 
-func (itr *_UnixFSShardedDir__ListItr) Next() (int64, dagpb.PBLink, error) {
+func (itr *_UnixFSShardedDir__ListItr) Next() (int64, dagpb.PBLink) {
+	next := itr.next()
+	if next == nil {
+		return -1, next
+	}
 	total := itr.total
 	itr.total++
-	next, err := itr.next()
-	if err != nil {
-		return -1, nil, err
-	}
-	if next == nil {
-		return -1, nil, nil
-	}
-	return total, next, nil
+	return total, next
 }
 
-func (itr *_UnixFSShardedDir__ListItr) next() (dagpb.PBLink, error) {
+func (itr *_UnixFSShardedDir__ListItr) next() dagpb.PBLink {
+
 	if itr.childIter == nil {
 		if itr._substrate.Done() {
-			return nil, nil
+			return nil
 		}
 		_, next := itr._substrate.Next()
 		isValue, err := isValueLink(next, itr.maxPadLen)
 		if err != nil {
-			return nil, err
+			return nil
 		}
 		if isValue {
-			return next, nil
+			return next
 		}
 		child, err := itr.nd.loadChild(next)
 		if err != nil {
-			return nil, err
+			return nil
 		}
 		itr.childIter = &_UnixFSShardedDir__ListItr{
 			_substrate: child._substrate.FieldLinks().Iterator(),
 			nd:         child,
 			maxPadLen:  maxPadLength(child.data),
 		}
+
 	}
-	_, next, err := itr.childIter.Next()
+	_, next := itr.childIter.Next()
 	if itr.childIter.Done() {
-		// do this even on error to make sure we don't overrun a shard where the
-		// end is missing and the user is ignoring NotFound errors
 		itr.childIter = nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	return next, nil
+	return next
 }
 
 func (itr *_UnixFSShardedDir__ListItr) Done() bool {
@@ -264,9 +236,9 @@ func (n UnixFSHAMTShard) ListIterator() ipld.ListIterator {
 
 // Length returns the length of a list, or the number of entries in a map,
 // or -1 if the node is not of list nor map kind.
-func (n UnixFSHAMTShard) length() (int64, error) {
+func (n UnixFSHAMTShard) Length() int64 {
 	if n.cachedLength != -1 {
-		return n.cachedLength, nil
+		return n.cachedLength
 	}
 	maxPadLen := maxPadLength(n.data)
 	total := int64(0)
@@ -275,34 +247,20 @@ func (n UnixFSHAMTShard) length() (int64, error) {
 		_, pbLink := itr.Next()
 		isValue, err := isValueLink(pbLink, maxPadLen)
 		if err != nil {
-			return 0, err
+			continue
 		}
 		if isValue {
 			total++
 		} else {
 			child, err := n.loadChild(pbLink)
 			if err != nil {
-				return 0, err
+				continue
 			}
-			cl, err := child.length()
-			if err != nil {
-				return 0, err
-			}
-			total += cl
+			total += child.Length()
 		}
 	}
 	n.cachedLength = total
-	return total, nil
-}
-
-// Length returns the length of a list, or the number of entries in a map,
-// or -1 if the node is not of list nor map kind.
-func (n UnixFSHAMTShard) Length() int64 {
-	len, err := n.length()
-	if err != nil {
-		return 0
-	}
-	return len
+	return total
 }
 
 func (n UnixFSHAMTShard) IsAbsent() bool {

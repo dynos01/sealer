@@ -25,6 +25,7 @@ var ErrClosed = errors.New("error: batch closed")
 // to add or remove a lot of nodes all at once.
 //
 // If the passed context is canceled, any in-progress commits are aborted.
+//
 func NewBatch(ctx context.Context, na NodeAdder, opts ...BatchOption) *Batch {
 	ctx, cancel := context.WithCancel(ctx)
 	bopts := defaultBatchOptions
@@ -105,6 +106,8 @@ func (t *Batch) asyncCommit() {
 	t.activeCommits++
 	t.nodes = make([]Node, 0, numBlocks)
 	t.size = 0
+
+	return
 }
 
 // Add adds a node to the batch and commits the batch if necessary.

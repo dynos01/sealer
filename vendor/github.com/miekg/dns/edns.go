@@ -78,10 +78,7 @@ func (rr *OPT) String() string {
 	if rr.Do() {
 		s += "flags: do; "
 	} else {
-		s += "flags:; "
-	}
-	if rr.Hdr.Ttl&0x7FFF != 0 {
-		s += fmt.Sprintf("MBZ: 0x%04x, ", rr.Hdr.Ttl&0x7FFF)
+		s += "flags: ; "
 	}
 	s += "udp: " + strconv.Itoa(int(rr.UDPSize()))
 
@@ -101,8 +98,6 @@ func (rr *OPT) String() string {
 			s += "\n; SUBNET: " + o.String()
 		case *EDNS0_COOKIE:
 			s += "\n; COOKIE: " + o.String()
-		case *EDNS0_EXPIRE:
-			s += "\n; EXPIRE: " + o.String()
 		case *EDNS0_TCP_KEEPALIVE:
 			s += "\n; KEEPALIVE: " + o.String()
 		case *EDNS0_UL:
@@ -263,7 +258,7 @@ func (e *EDNS0_NSID) copy() EDNS0           { return &EDNS0_NSID{e.Code, e.Nsid}
 //	o.Hdr.Name = "."
 //	o.Hdr.Rrtype = dns.TypeOPT
 //	e := new(dns.EDNS0_SUBNET)
-//	e.Code = dns.EDNS0SUBNET // by default this is filled in through unpacking OPT packets (unpackDataOpt)
+//	e.Code = dns.EDNS0SUBNET
 //	e.Family = 1	// 1 for IPv4 source address, 2 for IPv6
 //	e.SourceNetmask = 32	// 32 for IPV4, 128 for IPv6
 //	e.SourceScope = 0
@@ -520,8 +515,8 @@ type EDNS0_DAU struct {
 
 // Option implements the EDNS0 interface.
 func (e *EDNS0_DAU) Option() uint16        { return EDNS0DAU }
-func (e *EDNS0_DAU) pack() ([]byte, error) { return cloneSlice(e.AlgCode), nil }
-func (e *EDNS0_DAU) unpack(b []byte) error { e.AlgCode = cloneSlice(b); return nil }
+func (e *EDNS0_DAU) pack() ([]byte, error) { return e.AlgCode, nil }
+func (e *EDNS0_DAU) unpack(b []byte) error { e.AlgCode = b; return nil }
 
 func (e *EDNS0_DAU) String() string {
 	s := ""
@@ -544,8 +539,8 @@ type EDNS0_DHU struct {
 
 // Option implements the EDNS0 interface.
 func (e *EDNS0_DHU) Option() uint16        { return EDNS0DHU }
-func (e *EDNS0_DHU) pack() ([]byte, error) { return cloneSlice(e.AlgCode), nil }
-func (e *EDNS0_DHU) unpack(b []byte) error { e.AlgCode = cloneSlice(b); return nil }
+func (e *EDNS0_DHU) pack() ([]byte, error) { return e.AlgCode, nil }
+func (e *EDNS0_DHU) unpack(b []byte) error { e.AlgCode = b; return nil }
 
 func (e *EDNS0_DHU) String() string {
 	s := ""
@@ -568,8 +563,8 @@ type EDNS0_N3U struct {
 
 // Option implements the EDNS0 interface.
 func (e *EDNS0_N3U) Option() uint16        { return EDNS0N3U }
-func (e *EDNS0_N3U) pack() ([]byte, error) { return cloneSlice(e.AlgCode), nil }
-func (e *EDNS0_N3U) unpack(b []byte) error { e.AlgCode = cloneSlice(b); return nil }
+func (e *EDNS0_N3U) pack() ([]byte, error) { return e.AlgCode, nil }
+func (e *EDNS0_N3U) unpack(b []byte) error { e.AlgCode = b; return nil }
 
 func (e *EDNS0_N3U) String() string {
 	// Re-use the hash map
@@ -589,17 +584,14 @@ func (e *EDNS0_N3U) copy() EDNS0 { return &EDNS0_N3U{e.Code, e.AlgCode} }
 type EDNS0_EXPIRE struct {
 	Code   uint16 // Always EDNS0EXPIRE
 	Expire uint32
-	Empty  bool // Empty is used to signal an empty Expire option in a backwards compatible way, it's not used on the wire.
 }
 
 // Option implements the EDNS0 interface.
 func (e *EDNS0_EXPIRE) Option() uint16 { return EDNS0EXPIRE }
-func (e *EDNS0_EXPIRE) copy() EDNS0    { return &EDNS0_EXPIRE{e.Code, e.Expire, e.Empty} }
+func (e *EDNS0_EXPIRE) String() string { return strconv.FormatUint(uint64(e.Expire), 10) }
+func (e *EDNS0_EXPIRE) copy() EDNS0    { return &EDNS0_EXPIRE{e.Code, e.Expire} }
 
 func (e *EDNS0_EXPIRE) pack() ([]byte, error) {
-	if e.Empty {
-		return []byte{}, nil
-	}
 	b := make([]byte, 4)
 	binary.BigEndian.PutUint32(b, e.Expire)
 	return b, nil
@@ -608,22 +600,13 @@ func (e *EDNS0_EXPIRE) pack() ([]byte, error) {
 func (e *EDNS0_EXPIRE) unpack(b []byte) error {
 	if len(b) == 0 {
 		// zero-length EXPIRE query, see RFC 7314 Section 2
-		e.Empty = true
 		return nil
 	}
 	if len(b) < 4 {
 		return ErrBuf
 	}
 	e.Expire = binary.BigEndian.Uint32(b)
-	e.Empty = false
 	return nil
-}
-
-func (e *EDNS0_EXPIRE) String() (s string) {
-	if e.Empty {
-		return ""
-	}
-	return strconv.FormatUint(uint64(e.Expire), 10)
 }
 
 // The EDNS0_LOCAL option is used for local/experimental purposes. The option
@@ -646,21 +629,30 @@ type EDNS0_LOCAL struct {
 
 // Option implements the EDNS0 interface.
 func (e *EDNS0_LOCAL) Option() uint16 { return e.Code }
-
 func (e *EDNS0_LOCAL) String() string {
 	return strconv.FormatInt(int64(e.Code), 10) + ":0x" + hex.EncodeToString(e.Data)
 }
-
 func (e *EDNS0_LOCAL) copy() EDNS0 {
-	return &EDNS0_LOCAL{e.Code, cloneSlice(e.Data)}
+	b := make([]byte, len(e.Data))
+	copy(b, e.Data)
+	return &EDNS0_LOCAL{e.Code, b}
 }
 
 func (e *EDNS0_LOCAL) pack() ([]byte, error) {
-	return cloneSlice(e.Data), nil
+	b := make([]byte, len(e.Data))
+	copied := copy(b, e.Data)
+	if copied != len(e.Data) {
+		return nil, ErrBuf
+	}
+	return b, nil
 }
 
 func (e *EDNS0_LOCAL) unpack(b []byte) error {
-	e.Data = cloneSlice(b)
+	e.Data = make([]byte, len(b))
+	copied := copy(e.Data, b)
+	if copied != len(b) {
+		return ErrBuf
+	}
 	return nil
 }
 
@@ -723,10 +715,14 @@ type EDNS0_PADDING struct {
 
 // Option implements the EDNS0 interface.
 func (e *EDNS0_PADDING) Option() uint16        { return EDNS0PADDING }
-func (e *EDNS0_PADDING) pack() ([]byte, error) { return cloneSlice(e.Padding), nil }
-func (e *EDNS0_PADDING) unpack(b []byte) error { e.Padding = cloneSlice(b); return nil }
+func (e *EDNS0_PADDING) pack() ([]byte, error) { return e.Padding, nil }
+func (e *EDNS0_PADDING) unpack(b []byte) error { e.Padding = b; return nil }
 func (e *EDNS0_PADDING) String() string        { return fmt.Sprintf("%0X", e.Padding) }
-func (e *EDNS0_PADDING) copy() EDNS0           { return &EDNS0_PADDING{cloneSlice(e.Padding)} }
+func (e *EDNS0_PADDING) copy() EDNS0 {
+	b := make([]byte, len(e.Padding))
+	copy(b, e.Padding)
+	return &EDNS0_PADDING{b}
+}
 
 // Extended DNS Error Codes (RFC 8914).
 const (
@@ -813,7 +809,7 @@ func (e *EDNS0_EDE) String() string {
 func (e *EDNS0_EDE) pack() ([]byte, error) {
 	b := make([]byte, 2+len(e.ExtraText))
 	binary.BigEndian.PutUint16(b[0:], e.InfoCode)
-	copy(b[2:], e.ExtraText)
+	copy(b[2:], []byte(e.ExtraText))
 	return b, nil
 }
 

@@ -1,4 +1,5 @@
 //go:build windows
+// +build windows
 
 package netroute
 
@@ -193,18 +194,12 @@ func getIface(index uint32) *net.Interface {
 		return nil
 	}
 
-	physAddrLen := int(ifRow.PhysAddrLen)
-	if len(ifRow.PhysAddr) < physAddrLen && physAddrLen >= 0 {
-		physAddrLen = len(ifRow.PhysAddr)
-	}
-	physAddr := ifRow.PhysAddr[:physAddrLen]
-
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil
 	}
 	for _, iface := range ifaces {
-		if bytes.Equal(iface.HardwareAddr, physAddr) {
+		if bytes.Equal(iface.HardwareAddr, ifRow.PhysAddr[:]) {
 			return &iface
 		}
 	}

@@ -2,7 +2,8 @@ package libp2p
 
 import (
 	"github.com/libp2p/go-libp2p/config"
-	"github.com/libp2p/go-libp2p/core/host"
+
+	"github.com/libp2p/go-libp2p-core/host"
 )
 
 // Config describes a set of settings for a libp2p node.
@@ -33,11 +34,12 @@ func ChainOptions(opts ...Option) Option {
 // - If no transport and listen addresses are provided, the node listens to
 // the multiaddresses "/ip4/0.0.0.0/tcp/0" and "/ip6/::/tcp/0";
 //
-// - If no transport options are provided, the node uses TCP, websocket and QUIC
+// - If no transport options are provided, the node uses TCP and websocket
 // transport protocols;
 //
 // - If no multiplexer configuration is provided, the node is configured by
-// default to use yamux;
+// default to use the "yamux/1.0.0" and "mplux/6.7.0" stream connection
+// multiplexers;
 //
 // - If no security transport is provided, the host uses the go-libp2p's noise
 // and/or tls encrypted transport to encrypt all traffic;
