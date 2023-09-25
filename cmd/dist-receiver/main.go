@@ -46,7 +46,9 @@ func main() {
 	http.HandleFunc("/next", next)
 	http.HandleFunc("/connect", connect)
 	go func() {
-		http.ListenAndServe("0.0.0.0:4002", nil)
+		if err := http.ListenAndServe("0.0.0.0:4002", nil); err != nil {
+			panic(fmt.Errorf("failed to spawn command receiver: %s", err))
+		}
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -57,18 +59,27 @@ func main() {
 		panic(fmt.Errorf("failed to spawn ephemeral node: %s", err))
 	}
 
-	connectToPeers(ctx, node, []string{args[1]})
+	if err := connectToPeers(ctx, node, []string{args[1]}); err != nil {
+		fmt.Fprintln(os.Stderr, "Failed to connect to root peer: {}", err)
+	}
 
 	stageNow = 1
 
 	<-sig
 
-	connectToPeers(ctx, node, targets)
+	if err := connectToPeers(ctx, node, targets); err != nil {
+		fmt.Fprintln(os.Stderr, "Failed to connect to peers: {}", err)
+	}
 
 	cid := icorepath.New(args[2])
 
-	node.Dht().Provide(ctx, cid)
-	node.Pin().Add(ctx, cid)
+	if err := node.Dht().Provide(ctx, cid); err != nil {
+		fmt.Fprintln(os.Stderr, "Failed to seed the resource file: {}", err)
+	}
+
+	if err := node.Pin().Add(ctx, cid); err != nil {
+		fmt.Fprintln(os.Stderr, "Failed to pin the resource file: {}", err)
+	}
 
 	rootNode, err := node.Unixfs().Get(ctx, cid)
 
@@ -76,7 +87,9 @@ func main() {
 		panic(fmt.Errorf("could not get file with CID: %s", err))
 	}
 
-	os.RemoveAll(args[3])
+	if err := os.RemoveAll(args[3]); err != nil {
+		panic(fmt.Errorf("could not clean previous temporary file: %s", err))
+	}
 
 	err = files.WriteTo(rootNode, args[3])
 	if err != nil {
