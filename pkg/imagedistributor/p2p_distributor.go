@@ -16,7 +16,7 @@ package imagedistributor
 
 import (
 	"context"
-	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -406,7 +406,7 @@ func getUnixfsNode(path string) (files.Node, error) {
 }
 
 func tarGzDirectory(sourceDir string) (string, error) {
-	h := md5.New()
+	h := sha256.New()
 	h.Write([]byte(sourceDir))
 	name := hex.EncodeToString(h.Sum(nil))
 
