@@ -61,7 +61,9 @@ func (p *p2pDistributor) DistributeRegistry(deployHosts []net.IP, dataDir string
 
 		logrus.Infof("Distributing %s", info.MountDir)
 
-		p.distributeImpl(deployHosts, info.MountDir, dataDir)
+		if err := p.distributeImpl(deployHosts, info.MountDir, dataDir); err != nil {
+			return fmt.Errorf("failed to distribute: %s", err)
+		}
 	}
 
 	return nil
@@ -78,7 +80,9 @@ func (p *p2pDistributor) Distribute(hosts []net.IP, dest string) error {
 			return err
 		}
 
-		p.distributeImpl(hosts, info.MountDir, dest)
+		if err := p.distributeImpl(hosts, info.MountDir, dest); err != nil {
+			return fmt.Errorf("failed to distribute: %s", err)
+		}
 	}
 
 	return nil
