@@ -412,7 +412,8 @@ func tarGzDirectory(sourceDir string) (string, error) {
 
 	filename := fmt.Sprintf("%s.tar.gz", name)
 
-	cmd := exec.Command("tar", "-C", sourceDir, "-czf", filename, ".")
+	// the following command needs variable aurgments anyway, which will cause G204 in gosec
+	cmd := exec.Command("tar", "-C", sourceDir, "-czf", filename, ".") // #nosec G204
 	_, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to compress %s: %s", sourceDir, err)
