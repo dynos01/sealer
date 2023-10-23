@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	b64 "encoding/base64"
 
@@ -56,11 +57,18 @@ func main() {
 	stageNow = 0
 	sig = make(chan bool)
 
+	server := &http.Server{
+        Addr:         "0.0.0.0:4002",
+        ReadTimeout:  5 * time.Second,
+        WriteTimeout: 5 * time.Second,
+        IdleTimeout:  600 * time.Second,
+    }
+
 	http.HandleFunc("/stage", stage)
 	http.HandleFunc("/next", next)
 	http.HandleFunc("/connect", connect)
 	go func() {
-		if err := http.ListenAndServe("0.0.0.0:4002", nil); err != nil {
+		if err := server.ListenAndServe(); err != nil {
 			panic(fmt.Errorf("failed to spawn command receiver: %s", err))
 		}
 	}()
@@ -115,7 +123,8 @@ func main() {
 		panic(fmt.Errorf("failed to create target directory: %s", err))
 	}
 
-	cmd := exec.Command("tar", "-C", args[4], "-xzf", args[3])
+	// the following command needs variable aurgments anyway, which will cause G204 in gosec
+	cmd := exec.Command("tar", "-C", args[4], "-xzf", args[3]) // #nosec G204
 	_, err = cmd.Output()
 	if err != nil {
 		panic(fmt.Errorf("failed to uncompress resource file: %s", err))
@@ -125,7 +134,8 @@ func main() {
 
 	<-sig
 
-	exec.Command("rm", args[3])
+	// the following command needs variable aurgments anyway, which will cause G204 in gosec
+	exec.Command("rm", args[3]) // #nosec G204
 }
 
 func createNode(ctx context.Context, repoPath string) (*core.IpfsNode, error) {
